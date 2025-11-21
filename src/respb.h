@@ -350,10 +350,15 @@ typedef struct respbResponseHeader {
 struct client;
 struct serverObject;
 
+/* Server initialization - call once after command table is ready */
+void respbInitServer(void);
+
 /* Parsing functions */
 int parseRespbBuffer(struct client *c);
 const char *respbOpcodeToCommand(uint16_t opcode);
 int respbOpcodeFixedArgc(uint16_t opcode);
+struct redisCommand *respbOpcodeCommand(uint16_t opcode);
+struct serverObject *respbOpcodeSharedName(uint16_t opcode);
 
 /* Response functions - RESPB-aware wrappers */
 void addReplyRespbOK(struct client *c);

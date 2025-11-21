@@ -2347,6 +2347,7 @@ void initServerConfig(void) {
     server.commands = hashtableCreate(&commandSetType);
     server.orig_commands = hashtableCreate(&originalCommandSetType);
     populateCommandTable();
+    respbInitServer();  /* Initialize RESPB opcode-to-command cache */
 
     /* Debugging */
     server.watchdog_period = 0;
@@ -4125,9 +4126,11 @@ uint64_t getCommandFlags(client *c) {
  * done by I/O threads to offload the main-thread. */
 static void prepareCommandGeneric(robj **argv, int argc, int *read_flags, struct serverCommand **cmd, int *slot) {
     if (!(*read_flags & READ_FLAGS_PARSING_COMPLETED) || argc == 0) return;
-    /* Make sure we don't do this twice. */
-    debugServerAssert(*cmd == NULL && !(*read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
-    *cmd = lookupCommand(argv, argc);
+    /* Skip lookup if command already resolved (e.g., RESPB direct dispatch) */
+    if (*cmd == NULL) {
+        debugServerAssert(!(*read_flags & READ_FLAGS_COMMAND_NOT_FOUND));
+        *cmd = lookupCommand(argv, argc);
+    }
     if (!*cmd) {
         *read_flags |= READ_FLAGS_COMMAND_NOT_FOUND;
     } else if (!commandCheckArity(*cmd, argc, NULL)) {

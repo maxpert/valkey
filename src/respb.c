@@ -12,168 +12,201 @@
  * RESPB Opcode to Command Mapping
  * ============================================================================= */
 
-/* Structure to map RESPB opcodes to command names */
-typedef struct respbOpcodeMap {
-    uint16_t opcode;
-    const char *cmd_name;
-    int fixed_argc;  /* -1 for variable arity */
-} respbOpcodeMap;
+/* Structure for direct opcode lookup table - O(1) access */
+typedef struct respbOpcodeInfo {
+    const char *cmd_name;      /* NULL if opcode not valid */
+    int8_t fixed_argc;         /* -1 for variable arity, 0 if invalid */
+    robj *shared_name;         /* Shared robj for command name (server only) */
+    struct redisCommand *cmd;  /* Direct command pointer (server only) */
+} respbOpcodeInfo;
 
-/* Opcode mapping table - sorted by opcode for binary search */
-static const respbOpcodeMap opcodeTable[] = {
+/* Direct lookup table - indexed by opcode for O(1) access */
+#define RESPB_OPCODE_TABLE_SIZE 0x0400  /* 1024 entries covers all opcodes */
+static respbOpcodeInfo opcodeTable[RESPB_OPCODE_TABLE_SIZE];
+static int opcodeTableInitialized = 0;
+
+/* Initialize the direct lookup table - called once on first use */
+static void initOpcodeTable(void) {
+    if (opcodeTableInitialized) return;
+    memset(opcodeTable, 0, sizeof(opcodeTable));
+
     /* String operations */
-    {RESPB_OP_GET, "GET", 2},
-    {RESPB_OP_SET, "SET", -1},  /* Variable: SET key value [EX|PX|EXAT|PXAT] */
-    {RESPB_OP_MGET, "MGET", -1},
-    {RESPB_OP_MSET, "MSET", -1},
-    {RESPB_OP_INCR, "INCR", 2},
-    {RESPB_OP_DECR, "DECR", 2},
-    {RESPB_OP_INCRBY, "INCRBY", 3},
-    {RESPB_OP_DECRBY, "DECRBY", 3},
-    {RESPB_OP_APPEND, "APPEND", 3},
-    {RESPB_OP_STRLEN, "STRLEN", 2},
-    {RESPB_OP_GETRANGE, "GETRANGE", 4},
-    {RESPB_OP_SETRANGE, "SETRANGE", 4},
-    {RESPB_OP_SETNX, "SETNX", 3},
-    {RESPB_OP_SETEX, "SETEX", 4},
-    {RESPB_OP_PSETEX, "PSETEX", 4},
-    {RESPB_OP_GETSET, "GETSET", 3},
-    {RESPB_OP_GETEX, "GETEX", -1},
-    {RESPB_OP_GETDEL, "GETDEL", 2},
-    {RESPB_OP_INCRBYFLOAT, "INCRBYFLOAT", 3},
-    {RESPB_OP_MSETNX, "MSETNX", -1},
+    opcodeTable[RESPB_OP_GET] = (respbOpcodeInfo){"GET", 2};
+    opcodeTable[RESPB_OP_SET] = (respbOpcodeInfo){"SET", -1};
+    opcodeTable[RESPB_OP_MGET] = (respbOpcodeInfo){"MGET", -1};
+    opcodeTable[RESPB_OP_MSET] = (respbOpcodeInfo){"MSET", -1};
+    opcodeTable[RESPB_OP_INCR] = (respbOpcodeInfo){"INCR", 2};
+    opcodeTable[RESPB_OP_DECR] = (respbOpcodeInfo){"DECR", 2};
+    opcodeTable[RESPB_OP_INCRBY] = (respbOpcodeInfo){"INCRBY", 3};
+    opcodeTable[RESPB_OP_DECRBY] = (respbOpcodeInfo){"DECRBY", 3};
+    opcodeTable[RESPB_OP_APPEND] = (respbOpcodeInfo){"APPEND", 3};
+    opcodeTable[RESPB_OP_STRLEN] = (respbOpcodeInfo){"STRLEN", 2};
+    opcodeTable[RESPB_OP_GETRANGE] = (respbOpcodeInfo){"GETRANGE", 4};
+    opcodeTable[RESPB_OP_SETRANGE] = (respbOpcodeInfo){"SETRANGE", 4};
+    opcodeTable[RESPB_OP_SETNX] = (respbOpcodeInfo){"SETNX", 3};
+    opcodeTable[RESPB_OP_SETEX] = (respbOpcodeInfo){"SETEX", 4};
+    opcodeTable[RESPB_OP_PSETEX] = (respbOpcodeInfo){"PSETEX", 4};
+    opcodeTable[RESPB_OP_GETSET] = (respbOpcodeInfo){"GETSET", 3};
+    opcodeTable[RESPB_OP_GETEX] = (respbOpcodeInfo){"GETEX", -1};
+    opcodeTable[RESPB_OP_GETDEL] = (respbOpcodeInfo){"GETDEL", 2};
+    opcodeTable[RESPB_OP_INCRBYFLOAT] = (respbOpcodeInfo){"INCRBYFLOAT", 3};
+    opcodeTable[RESPB_OP_MSETNX] = (respbOpcodeInfo){"MSETNX", -1};
 
     /* List operations */
-    {RESPB_OP_LPUSH, "LPUSH", -1},
-    {RESPB_OP_RPUSH, "RPUSH", -1},
-    {RESPB_OP_LPOP, "LPOP", -1},
-    {RESPB_OP_RPOP, "RPOP", -1},
-    {RESPB_OP_LRANGE, "LRANGE", 4},
-    {RESPB_OP_LLEN, "LLEN", 2},
-    {RESPB_OP_LINDEX, "LINDEX", 3},
-    {RESPB_OP_LSET, "LSET", 4},
-    {RESPB_OP_LREM, "LREM", 4},
-    {RESPB_OP_LTRIM, "LTRIM", 4},
+    opcodeTable[RESPB_OP_LPUSH] = (respbOpcodeInfo){"LPUSH", -1};
+    opcodeTable[RESPB_OP_RPUSH] = (respbOpcodeInfo){"RPUSH", -1};
+    opcodeTable[RESPB_OP_LPOP] = (respbOpcodeInfo){"LPOP", -1};
+    opcodeTable[RESPB_OP_RPOP] = (respbOpcodeInfo){"RPOP", -1};
+    opcodeTable[RESPB_OP_LRANGE] = (respbOpcodeInfo){"LRANGE", 4};
+    opcodeTable[RESPB_OP_LLEN] = (respbOpcodeInfo){"LLEN", 2};
+    opcodeTable[RESPB_OP_LINDEX] = (respbOpcodeInfo){"LINDEX", 3};
+    opcodeTable[RESPB_OP_LSET] = (respbOpcodeInfo){"LSET", 4};
+    opcodeTable[RESPB_OP_LREM] = (respbOpcodeInfo){"LREM", 4};
+    opcodeTable[RESPB_OP_LTRIM] = (respbOpcodeInfo){"LTRIM", 4};
 
     /* Set operations */
-    {RESPB_OP_SADD, "SADD", -1},
-    {RESPB_OP_SREM, "SREM", -1},
-    {RESPB_OP_SMEMBERS, "SMEMBERS", 2},
-    {RESPB_OP_SISMEMBER, "SISMEMBER", 3},
-    {RESPB_OP_SCARD, "SCARD", 2},
-    {RESPB_OP_SPOP, "SPOP", -1},
-    {RESPB_OP_SRANDMEMBER, "SRANDMEMBER", -1},
+    opcodeTable[RESPB_OP_SADD] = (respbOpcodeInfo){"SADD", -1};
+    opcodeTable[RESPB_OP_SREM] = (respbOpcodeInfo){"SREM", -1};
+    opcodeTable[RESPB_OP_SMEMBERS] = (respbOpcodeInfo){"SMEMBERS", 2};
+    opcodeTable[RESPB_OP_SISMEMBER] = (respbOpcodeInfo){"SISMEMBER", 3};
+    opcodeTable[RESPB_OP_SCARD] = (respbOpcodeInfo){"SCARD", 2};
+    opcodeTable[RESPB_OP_SPOP] = (respbOpcodeInfo){"SPOP", -1};
+    opcodeTable[RESPB_OP_SRANDMEMBER] = (respbOpcodeInfo){"SRANDMEMBER", -1};
 
     /* Sorted set operations */
-    {RESPB_OP_ZADD, "ZADD", -1},
-    {RESPB_OP_ZREM, "ZREM", -1},
-    {RESPB_OP_ZRANGE, "ZRANGE", -1},
-    {RESPB_OP_ZSCORE, "ZSCORE", 3},
-    {RESPB_OP_ZRANK, "ZRANK", 3},
-    {RESPB_OP_ZCARD, "ZCARD", 2},
-    {RESPB_OP_ZCOUNT, "ZCOUNT", 4},
-    {RESPB_OP_ZINCRBY, "ZINCRBY", 4},
+    opcodeTable[RESPB_OP_ZADD] = (respbOpcodeInfo){"ZADD", -1};
+    opcodeTable[RESPB_OP_ZREM] = (respbOpcodeInfo){"ZREM", -1};
+    opcodeTable[RESPB_OP_ZRANGE] = (respbOpcodeInfo){"ZRANGE", -1};
+    opcodeTable[RESPB_OP_ZSCORE] = (respbOpcodeInfo){"ZSCORE", 3};
+    opcodeTable[RESPB_OP_ZRANK] = (respbOpcodeInfo){"ZRANK", 3};
+    opcodeTable[RESPB_OP_ZCARD] = (respbOpcodeInfo){"ZCARD", 2};
+    opcodeTable[RESPB_OP_ZCOUNT] = (respbOpcodeInfo){"ZCOUNT", 4};
+    opcodeTable[RESPB_OP_ZINCRBY] = (respbOpcodeInfo){"ZINCRBY", 4};
 
     /* Hash operations */
-    {RESPB_OP_HSET, "HSET", -1},
-    {RESPB_OP_HGET, "HGET", 3},
-    {RESPB_OP_HMSET, "HMSET", -1},
-    {RESPB_OP_HMGET, "HMGET", -1},
-    {RESPB_OP_HGETALL, "HGETALL", 2},
-    {RESPB_OP_HDEL, "HDEL", -1},
-    {RESPB_OP_HEXISTS, "HEXISTS", 3},
-    {RESPB_OP_HLEN, "HLEN", 2},
-    {RESPB_OP_HKEYS, "HKEYS", 2},
-    {RESPB_OP_HVALS, "HVALS", 2},
-    {RESPB_OP_HINCRBY, "HINCRBY", 4},
-    {RESPB_OP_HINCRBYFLOAT, "HINCRBYFLOAT", 4},
-    {RESPB_OP_HSETNX, "HSETNX", 4},
+    opcodeTable[RESPB_OP_HSET] = (respbOpcodeInfo){"HSET", -1};
+    opcodeTable[RESPB_OP_HGET] = (respbOpcodeInfo){"HGET", 3};
+    opcodeTable[RESPB_OP_HMSET] = (respbOpcodeInfo){"HMSET", -1};
+    opcodeTable[RESPB_OP_HMGET] = (respbOpcodeInfo){"HMGET", -1};
+    opcodeTable[RESPB_OP_HGETALL] = (respbOpcodeInfo){"HGETALL", 2};
+    opcodeTable[RESPB_OP_HDEL] = (respbOpcodeInfo){"HDEL", -1};
+    opcodeTable[RESPB_OP_HEXISTS] = (respbOpcodeInfo){"HEXISTS", 3};
+    opcodeTable[RESPB_OP_HLEN] = (respbOpcodeInfo){"HLEN", 2};
+    opcodeTable[RESPB_OP_HKEYS] = (respbOpcodeInfo){"HKEYS", 2};
+    opcodeTable[RESPB_OP_HVALS] = (respbOpcodeInfo){"HVALS", 2};
+    opcodeTable[RESPB_OP_HINCRBY] = (respbOpcodeInfo){"HINCRBY", 4};
+    opcodeTable[RESPB_OP_HINCRBYFLOAT] = (respbOpcodeInfo){"HINCRBYFLOAT", 4};
+    opcodeTable[RESPB_OP_HSETNX] = (respbOpcodeInfo){"HSETNX", 4};
 
-    /* Generic key operations */
-    {RESPB_OP_DEL, "DEL", -1},
-    {RESPB_OP_EXISTS, "EXISTS", -1},
-    {RESPB_OP_EXPIRE, "EXPIRE", -1},
-    {RESPB_OP_EXPIREAT, "EXPIREAT", -1},
-    {RESPB_OP_PEXPIRE, "PEXPIRE", -1},
-    {RESPB_OP_PEXPIREAT, "PEXPIREAT", -1},
-    {RESPB_OP_TTL, "TTL", 2},
-    {RESPB_OP_PTTL, "PTTL", 2},
-    {RESPB_OP_PERSIST, "PERSIST", 2},
-    {RESPB_OP_TYPE, "TYPE", 2},
-    {RESPB_OP_KEYS, "KEYS", 2},
-    {RESPB_OP_SCAN, "SCAN", -1},
-    {RESPB_OP_RENAME, "RENAME", 3},
-    {RESPB_OP_RENAMENX, "RENAMENX", 3},
-    {RESPB_OP_UNLINK, "UNLINK", -1},
-    {RESPB_OP_TOUCH, "TOUCH", -1},
-    {RESPB_OP_EXPIRETIME, "EXPIRETIME", 2},
-    {RESPB_OP_PEXPIRETIME, "PEXPIRETIME", 2},
+    /* Key operations */
+    opcodeTable[RESPB_OP_DEL] = (respbOpcodeInfo){"DEL", -1};
+    opcodeTable[RESPB_OP_EXISTS] = (respbOpcodeInfo){"EXISTS", -1};
+    opcodeTable[RESPB_OP_EXPIRE] = (respbOpcodeInfo){"EXPIRE", -1};
+    opcodeTable[RESPB_OP_EXPIREAT] = (respbOpcodeInfo){"EXPIREAT", -1};
+    opcodeTable[RESPB_OP_PEXPIRE] = (respbOpcodeInfo){"PEXPIRE", -1};
+    opcodeTable[RESPB_OP_PEXPIREAT] = (respbOpcodeInfo){"PEXPIREAT", -1};
+    opcodeTable[RESPB_OP_TTL] = (respbOpcodeInfo){"TTL", 2};
+    opcodeTable[RESPB_OP_PTTL] = (respbOpcodeInfo){"PTTL", 2};
+    opcodeTable[RESPB_OP_PERSIST] = (respbOpcodeInfo){"PERSIST", 2};
+    opcodeTable[RESPB_OP_TYPE] = (respbOpcodeInfo){"TYPE", 2};
+    opcodeTable[RESPB_OP_KEYS] = (respbOpcodeInfo){"KEYS", 2};
+    opcodeTable[RESPB_OP_SCAN] = (respbOpcodeInfo){"SCAN", -1};
+    opcodeTable[RESPB_OP_RENAME] = (respbOpcodeInfo){"RENAME", 3};
+    opcodeTable[RESPB_OP_RENAMENX] = (respbOpcodeInfo){"RENAMENX", 3};
+    opcodeTable[RESPB_OP_UNLINK] = (respbOpcodeInfo){"UNLINK", -1};
+    opcodeTable[RESPB_OP_TOUCH] = (respbOpcodeInfo){"TOUCH", -1};
+    opcodeTable[RESPB_OP_EXPIRETIME] = (respbOpcodeInfo){"EXPIRETIME", 2};
+    opcodeTable[RESPB_OP_PEXPIRETIME] = (respbOpcodeInfo){"PEXPIRETIME", 2};
 
-    /* Connection management */
-    {RESPB_OP_AUTH, "AUTH", -1},
-    {RESPB_OP_PING, "PING", -1},
-    {RESPB_OP_ECHO, "ECHO", 2},
-    {RESPB_OP_QUIT, "QUIT", 1},
-    {RESPB_OP_SELECT, "SELECT", 2},
-    {RESPB_OP_CLIENT, "CLIENT", -1},
-    {RESPB_OP_HELLO, "HELLO", -1},
+    /* Connection */
+    opcodeTable[RESPB_OP_AUTH] = (respbOpcodeInfo){"AUTH", -1};
+    opcodeTable[RESPB_OP_PING] = (respbOpcodeInfo){"PING", -1};
+    opcodeTable[RESPB_OP_ECHO] = (respbOpcodeInfo){"ECHO", 2};
+    opcodeTable[RESPB_OP_QUIT] = (respbOpcodeInfo){"QUIT", 1};
+    opcodeTable[RESPB_OP_SELECT] = (respbOpcodeInfo){"SELECT", 2};
+    opcodeTable[RESPB_OP_CLIENT] = (respbOpcodeInfo){"CLIENT", -1};
+    opcodeTable[RESPB_OP_HELLO] = (respbOpcodeInfo){"HELLO", -1};
 
     /* Cluster */
-    {RESPB_OP_CLUSTER, "CLUSTER", -1},
-    {RESPB_OP_ASKING, "ASKING", 1},
-    {RESPB_OP_READONLY, "READONLY", 1},
-    {RESPB_OP_READWRITE, "READWRITE", 1},
+    opcodeTable[RESPB_OP_CLUSTER] = (respbOpcodeInfo){"CLUSTER", -1};
+    opcodeTable[RESPB_OP_ASKING] = (respbOpcodeInfo){"ASKING", 1};
+    opcodeTable[RESPB_OP_READONLY] = (respbOpcodeInfo){"READONLY", 1};
+    opcodeTable[RESPB_OP_READWRITE] = (respbOpcodeInfo){"READWRITE", 1};
 
     /* Server */
-    {RESPB_OP_INFO, "INFO", -1},
-    {RESPB_OP_CONFIG, "CONFIG", -1},
-    {RESPB_OP_DBSIZE, "DBSIZE", 1},
-    {RESPB_OP_FLUSHDB, "FLUSHDB", -1},
-    {RESPB_OP_FLUSHALL, "FLUSHALL", -1},
-    {RESPB_OP_TIME, "TIME", 1},
-    {RESPB_OP_COMMAND, "COMMAND", -1},
+    opcodeTable[RESPB_OP_INFO] = (respbOpcodeInfo){"INFO", -1};
+    opcodeTable[RESPB_OP_CONFIG] = (respbOpcodeInfo){"CONFIG", -1};
+    opcodeTable[RESPB_OP_DBSIZE] = (respbOpcodeInfo){"DBSIZE", 1};
+    opcodeTable[RESPB_OP_FLUSHDB] = (respbOpcodeInfo){"FLUSHDB", -1};
+    opcodeTable[RESPB_OP_FLUSHALL] = (respbOpcodeInfo){"FLUSHALL", -1};
+    opcodeTable[RESPB_OP_TIME] = (respbOpcodeInfo){"TIME", 1};
+    opcodeTable[RESPB_OP_COMMAND] = (respbOpcodeInfo){"COMMAND", -1};
 
     /* Pub/Sub */
-    {RESPB_OP_PUBLISH, "PUBLISH", 3},
-    {RESPB_OP_SUBSCRIBE, "SUBSCRIBE", -1},
-    {RESPB_OP_UNSUBSCRIBE, "UNSUBSCRIBE", -1},
-    {RESPB_OP_PSUBSCRIBE, "PSUBSCRIBE", -1},
-    {RESPB_OP_PUNSUBSCRIBE, "PUNSUBSCRIBE", -1},
+    opcodeTable[RESPB_OP_PUBLISH] = (respbOpcodeInfo){"PUBLISH", 3};
+    opcodeTable[RESPB_OP_SUBSCRIBE] = (respbOpcodeInfo){"SUBSCRIBE", -1};
+    opcodeTable[RESPB_OP_UNSUBSCRIBE] = (respbOpcodeInfo){"UNSUBSCRIBE", -1};
+    opcodeTable[RESPB_OP_PSUBSCRIBE] = (respbOpcodeInfo){"PSUBSCRIBE", -1};
+    opcodeTable[RESPB_OP_PUNSUBSCRIBE] = (respbOpcodeInfo){"PUNSUBSCRIBE", -1};
 
     /* Transactions */
-    {RESPB_OP_MULTI, "MULTI", 1},
-    {RESPB_OP_EXEC, "EXEC", 1},
-    {RESPB_OP_DISCARD, "DISCARD", 1},
-    {RESPB_OP_WATCH, "WATCH", -1},
-    {RESPB_OP_UNWATCH, "UNWATCH", 1},
+    opcodeTable[RESPB_OP_MULTI] = (respbOpcodeInfo){"MULTI", 1};
+    opcodeTable[RESPB_OP_EXEC] = (respbOpcodeInfo){"EXEC", 1};
+    opcodeTable[RESPB_OP_DISCARD] = (respbOpcodeInfo){"DISCARD", 1};
+    opcodeTable[RESPB_OP_WATCH] = (respbOpcodeInfo){"WATCH", -1};
+    opcodeTable[RESPB_OP_UNWATCH] = (respbOpcodeInfo){"UNWATCH", 1};
 
     /* Scripting */
-    {RESPB_OP_EVAL, "EVAL", -1},
-    {RESPB_OP_EVALSHA, "EVALSHA", -1},
-    {RESPB_OP_FCALL, "FCALL", -1},
-    {RESPB_OP_FCALL_RO, "FCALL_RO", -1},
-};
+    opcodeTable[RESPB_OP_EVAL] = (respbOpcodeInfo){"EVAL", -1};
+    opcodeTable[RESPB_OP_EVALSHA] = (respbOpcodeInfo){"EVALSHA", -1};
+    opcodeTable[RESPB_OP_FCALL] = (respbOpcodeInfo){"FCALL", -1};
+    opcodeTable[RESPB_OP_FCALL_RO] = (respbOpcodeInfo){"FCALL_RO", -1};
 
-#define OPCODE_TABLE_SIZE (sizeof(opcodeTable) / sizeof(opcodeTable[0]))
-
-/* Find command name for opcode - returns NULL if not found */
-const char *respbOpcodeToCommand(uint16_t opcode) {
-    for (size_t i = 0; i < OPCODE_TABLE_SIZE; i++) {
-        if (opcodeTable[i].opcode == opcode) {
-            return opcodeTable[i].cmd_name;
-        }
-    }
-    return NULL;
+    opcodeTableInitialized = 1;
 }
 
-/* Get fixed argc for opcode, returns -1 for variable arity */
-int respbOpcodeFixedArgc(uint16_t opcode) {
-    for (size_t i = 0; i < OPCODE_TABLE_SIZE; i++) {
-        if (opcodeTable[i].opcode == opcode) {
-            return opcodeTable[i].fixed_argc;
+/* Server-only initialization - creates shared objects and resolves commands */
+static int serverInitDone = 0;
+void respbInitServer(void) {
+    if (serverInitDone) return;
+    initOpcodeTable();
+
+    for (int i = 0; i < RESPB_OPCODE_TABLE_SIZE; i++) {
+        if (opcodeTable[i].cmd_name) {
+            /* Create shared robj for command name */
+            opcodeTable[i].shared_name = createStringObject(
+                opcodeTable[i].cmd_name, strlen(opcodeTable[i].cmd_name));
+            /* Lookup and cache the command pointer */
+            opcodeTable[i].cmd = lookupCommandByCString((char*)opcodeTable[i].cmd_name);
         }
     }
-    return -1;
+    serverInitDone = 1;
+}
+
+/* Get cached command for opcode - O(1), no string lookup */
+struct redisCommand *respbOpcodeCommand(uint16_t opcode) {
+    if (opcode >= RESPB_OPCODE_TABLE_SIZE) return NULL;
+    return opcodeTable[opcode].cmd;
+}
+
+/* Get shared command name robj for opcode - O(1), no allocation */
+robj *respbOpcodeSharedName(uint16_t opcode) {
+    if (opcode >= RESPB_OPCODE_TABLE_SIZE) return NULL;
+    return opcodeTable[opcode].shared_name;
+}
+
+/* Find command name for opcode - O(1) direct lookup */
+const char *respbOpcodeToCommand(uint16_t opcode) {
+    initOpcodeTable();
+    if (opcode >= RESPB_OPCODE_TABLE_SIZE) return NULL;
+    return opcodeTable[opcode].cmd_name;
+}
+
+/* Get fixed argc for opcode - O(1) direct lookup */
+int respbOpcodeFixedArgc(uint16_t opcode) {
+    initOpcodeTable();
+    if (opcode >= RESPB_OPCODE_TABLE_SIZE) return 0;
+    return opcodeTable[opcode].fixed_argc;
 }
 
 /* =============================================================================
@@ -288,10 +321,21 @@ int parseRespbBuffer(client *c) {
     c->argv = zmalloc(sizeof(robj *) * argc);
     c->argv_len_sum = 0;
 
-    /* First argument is always the command name */
-    c->argv[0] = createStringObject(cmd_name, strlen(cmd_name));
-    c->argv_len_sum += strlen(cmd_name);
+    /* First argument is the shared command name (no allocation) */
+    robj *shared_name = respbOpcodeSharedName(opcode);
+    if (shared_name) {
+        incrRefCount(shared_name);
+        c->argv[0] = shared_name;
+        c->argv_len_sum += sdslen(shared_name->ptr);
+    } else {
+        /* Fallback for uninitialized server */
+        c->argv[0] = createStringObject(cmd_name, strlen(cmd_name));
+        c->argv_len_sum += strlen(cmd_name);
+    }
     c->argc = 1;
+
+    /* Set command directly - bypass string lookup in prepareCommand */
+    c->parsed_cmd = respbOpcodeCommand(opcode);
 
     /* Read remaining arguments */
     for (int i = 1; i < argc; i++) {
