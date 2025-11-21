@@ -735,6 +735,77 @@ static void _addBulkStrRefToBufferOrList(client *c, robj *obj) {
 void addReply(client *c, robj *obj) {
     if (prepareClientToWrite(c) != C_OK) return;
 
+    /* Handle RESPB mode for common shared objects */
+    if (c->resp == 4) {
+        if (obj == shared.ok || obj == shared.queued) {
+            addReplyRespbOK(c);
+            return;
+        } else if (obj == shared.czero) {
+            addReplyRespbLongLong(c, 0);
+            return;
+        } else if (obj == shared.cone) {
+            addReplyRespbLongLong(c, 1);
+            return;
+        } else if (obj == shared.null[4] || obj == shared.nullarray[4]) {
+            addReplyRespbNull(c);
+            return;
+        } else if (obj == shared.emptymap[4]) {
+            addReplyRespbMapLen(c, 0);
+            return;
+        } else if (obj == shared.emptyset[4]) {
+            addReplyRespbArrayLen(c, 0);
+            return;
+        }
+        /* For other sds objects in RESPB mode, parse RESP and convert */
+        if (sdsEncodedObject(obj)) {
+            sds s = obj->ptr;
+            size_t len = sdslen(s);
+            if (len > 0) {
+                char type = s[0];
+                if (type == '+') {
+                    /* Simple string - convert to OK or bulk */
+                    if (len >= 5 && s[1] == 'O' && s[2] == 'K' && s[3] == '\r') {
+                        addReplyRespbOK(c);
+                    } else {
+                        /* Find end of string (before \r\n) */
+                        size_t msglen = len - 3; /* skip + and \r\n */
+                        addReplyRespbBulkCBuffer(c, s + 1, msglen);
+                    }
+                    return;
+                } else if (type == '-') {
+                    /* Error string - need to null-terminate without \r\n */
+                    size_t msglen = len - 3; /* skip - and \r\n */
+                    char *errmsg = zmalloc(msglen + 1);
+                    memcpy(errmsg, s + 1, msglen);
+                    errmsg[msglen] = '\0';
+                    addReplyRespbError(c, errmsg);
+                    zfree(errmsg);
+                    return;
+                } else if (type == ':') {
+                    /* Integer */
+                    long long val = strtoll(s + 1, NULL, 10);
+                    addReplyRespbLongLong(c, val);
+                    return;
+                } else if (type == '$') {
+                    /* Bulk string - extract data after length */
+                    char *p = s + 1;
+                    long bulklen = strtol(p, &p, 10);
+                    if (bulklen == -1) {
+                        addReplyRespbNull(c);
+                    } else {
+                        p += 2; /* skip \r\n */
+                        addReplyRespbBulkCBuffer(c, p, bulklen);
+                    }
+                    return;
+                } else if (type == '_') {
+                    /* RESP3 null */
+                    addReplyRespbNull(c);
+                    return;
+                }
+            }
+        }
+    }
+
     if (sdsEncodedObject(obj)) {
         _addReplyToBufferOrList(c, obj->ptr, sdslen(obj->ptr));
     } else if (obj->encoding == OBJ_ENCODING_INT) {
@@ -1295,6 +1366,10 @@ static void _addReplyLongLongWithPrefix(client *c, long long ll, char prefix) {
 }
 
 void addReplyLongLong(client *c, long long ll) {
+    if (c->resp == 4) {
+        addReplyRespbLongLong(c, ll);
+        return;
+    }
     if (ll == 0)
         addReply(c, shared.czero);
     else if (ll == 1)
@@ -1312,6 +1387,10 @@ void addReplyAggregateLen(client *c, long length, int prefix) {
 }
 
 void addReplyArrayLen(client *c, long length) {
+    if (c->resp == 4) {
+        addReplyRespbArrayLen(c, length);
+        return;
+    }
     addReplyAggregateLen(c, length, '*');
 }
 
@@ -1322,6 +1401,10 @@ void addWritePreparedReplyArrayLen(writePreparedClient *wpc, long length) {
 }
 
 void addReplyMapLen(client *c, long length) {
+    if (c->resp == 4) {
+        addReplyRespbMapLen(c, length);
+        return;
+    }
     int prefix = c->resp == 2 ? '*' : '%';
     if (c->resp == 2) length *= 2;
     addReplyAggregateLen(c, length, prefix);
@@ -1351,7 +1434,9 @@ void addReplyPushLen(client *c, long length) {
 }
 
 void addReplyNull(client *c) {
-    if (c->resp == 2) {
+    if (c->resp == 4) {
+        addReplyRespbNull(c);
+    } else if (c->resp == 2) {
         addReplyProto(c, "$-1\r\n", 5);
     } else {
         addReplyProto(c, "_\r\n", 3);
@@ -1359,7 +1444,9 @@ void addReplyNull(client *c) {
 }
 
 void addReplyBool(client *c, int b) {
-    if (c->resp == 2) {
+    if (c->resp == 4) {
+        addReplyRespbBool(c, b);
+    } else if (c->resp == 2) {
         addReply(c, b ? shared.cone : shared.czero);
     } else {
         addReplyProto(c, b ? "#t\r\n" : "#f\r\n", 4);
@@ -1398,6 +1485,10 @@ static int tryAvoidBulkStrCopyToReply(client *c, robj *obj) {
 
 /* Add an Object as a bulk reply */
 void addReplyBulk(client *c, robj *obj) {
+    if (c->resp == 4) {
+        addReplyRespbBulk(c, obj);
+        return;
+    }
     if (tryAvoidBulkStrCopyToReply(c, obj) == C_OK) return;
     addReplyBulkLen(c, obj);
     addReply(c, obj);
@@ -1406,6 +1497,10 @@ void addReplyBulk(client *c, robj *obj) {
 
 /* Add a C buffer as bulk reply */
 void addReplyBulkCBuffer(client *c, const void *p, size_t len) {
+    if (c->resp == 4) {
+        addReplyRespbBulkCBuffer(c, p, len);
+        return;
+    }
     if (prepareClientToWrite(c) != C_OK) return;
     _addReplyLongLongWithPrefix(c, len, '$');
     _addReplyToBufferOrList(c, p, len);
@@ -3776,8 +3871,12 @@ void parseInputBuffer(client *c) {
 
     /* Determine request type when unknown. */
     if (!c->reqtype) {
-        if (c->querybuf[c->qb_pos] == '*') {
+        unsigned char first_byte = (unsigned char)c->querybuf[c->qb_pos];
+        if (first_byte == '*') {
             c->reqtype = PROTO_REQ_MULTIBULK;
+        } else if (IS_RESPB_BYTE(first_byte)) {
+            /* RESPB binary protocol detected */
+            c->reqtype = PROTO_REQ_RESPB;
         } else {
             c->reqtype = PROTO_REQ_INLINE;
         }
@@ -3787,6 +3886,8 @@ void parseInputBuffer(client *c) {
         parseInlineBuffer(c);
     } else if (c->reqtype == PROTO_REQ_MULTIBULK) {
         parseMultibulkBuffer(c);
+    } else if (c->reqtype == PROTO_REQ_RESPB) {
+        parseRespbBuffer(c);
     } else {
         serverPanic("Unknown request type");
     }
@@ -5583,7 +5684,7 @@ void helloCommand(client *c) {
             return;
         }
 
-        if (ver < 2 || ver > 3) {
+        if (ver < 2 || ver > 4) {
             addReplyError(c, "-NOPROTO unsupported protocol version");
             return;
         }

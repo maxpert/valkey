@@ -68,6 +68,7 @@
 #include "ae.h"
 #include "connection.h"
 #include "cli_common.h"
+#include "respb.h"
 #include "mt19937-64.h"
 #include "cli_commands.h"
 
@@ -283,6 +284,8 @@ static struct config {
     int resp2;         /* value of 1: specified explicitly with option -2 */
     int resp3;         /* value of 1: specified explicitly, value of 2: implicit like --json option */
     int current_resp3; /* 1 if we have RESP3 right now in the current connection. */
+    int respb;         /* value of 1: use RESPB binary protocol */
+    int current_respb; /* 1 if we have RESPB right now in the current connection. */
     int in_multi;
     int pre_multi_dbnum;
     char *server_version;
@@ -1631,6 +1634,153 @@ static int cliSwitchProto(void) {
     return result;
 }
 
+/* Switch to RESPB mode if valkey-cli was started with the -4 option. */
+static int cliSwitchToRespb(void) {
+    if (!config.respb) return VALKEY_OK;
+
+    /* Send HELLO 4 using RESP format */
+    valkeyReply *reply = valkeyCommand(context, "HELLO 4");
+    if (reply == NULL) {
+        fprintf(stderr, "\nI/O error\n");
+        return VALKEY_ERR;
+    }
+
+    /* The response is in RESPB format - we need to parse it manually.
+     * But since valkeyCommand uses libvalkey's parser which doesn't understand
+     * RESPB, we'll get an error. Let's handle this by reading raw bytes. */
+    freeReplyObject(reply);
+
+    /* Read raw RESPB response from socket */
+    int fd = context->fd;
+    char buf[4096];
+    ssize_t nread = read(fd, buf, sizeof(buf));
+    if (nread <= 0) {
+        fprintf(stderr, "Failed to read RESPB HELLO response\n");
+        return VALKEY_ERR;
+    }
+
+    /* Parse RESPB response */
+    uint16_t type, mux_id;
+    const char *data;
+    size_t datalen;
+    int consumed = respbParseResponse(buf, nread, &type, &mux_id, &data, &datalen);
+    if (consumed <= 0) {
+        fprintf(stderr, "Failed to parse RESPB HELLO response\n");
+        return VALKEY_ERR;
+    }
+
+    if (type == RESPB_RESP_ERROR) {
+        fprintf(stderr, "HELLO 4 failed: %.*s\n", (int)datalen, data);
+        return VALKEY_ERR;
+    }
+
+    config.current_respb = 1;
+    return VALKEY_OK;
+}
+
+/* Send command in RESPB format and receive response */
+static valkeyReply *cliRespbCommand(int argc, char **argv) {
+    /* Build RESPB command */
+    size_t *argvlen = zmalloc(sizeof(size_t) * argc);
+    const char **cargv = zmalloc(sizeof(char *) * argc);
+    for (int i = 0; i < argc; i++) {
+        cargv[i] = argv[i];
+        argvlen[i] = strlen(argv[i]);
+    }
+
+    size_t cmdlen;
+    char *cmd = respbFormatCommand(&cmdlen, argc, cargv, argvlen);
+    zfree(argvlen);
+    zfree(cargv);
+
+    if (!cmd) {
+        fprintf(stderr, "Failed to format RESPB command\n");
+        return NULL;
+    }
+
+    /* Send command */
+    int fd = context->fd;
+    ssize_t nwritten = write(fd, cmd, cmdlen);
+    zfree(cmd);
+    if (nwritten != (ssize_t)cmdlen) {
+        fprintf(stderr, "Failed to send RESPB command\n");
+        return NULL;
+    }
+
+    /* Read response */
+    char buf[65536];
+    size_t buflen = 0;
+    while (1) {
+        ssize_t nread = read(fd, buf + buflen, sizeof(buf) - buflen);
+        if (nread <= 0) {
+            if (nread == 0) {
+                fprintf(stderr, "Connection closed\n");
+            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                fprintf(stderr, "Read error: %s\n", strerror(errno));
+            }
+            return NULL;
+        }
+        buflen += nread;
+
+        /* Try to parse response */
+        uint16_t type, mux_id;
+        const char *data;
+        size_t datalen;
+        int consumed = respbParseResponse(buf, buflen, &type, &mux_id, &data, &datalen);
+        if (consumed > 0) {
+            /* Create a valkeyReply from the RESPB response */
+            valkeyReply *reply = zmalloc(sizeof(valkeyReply));
+            memset(reply, 0, sizeof(*reply));
+
+            switch (type) {
+            case RESPB_RESP_OK:
+                reply->type = VALKEY_REPLY_STATUS;
+                reply->str = zstrdup("OK");
+                reply->len = 2;
+                break;
+            case RESPB_RESP_ERROR:
+                reply->type = VALKEY_REPLY_ERROR;
+                reply->str = zmalloc(datalen + 1);
+                memcpy(reply->str, data, datalen);
+                reply->str[datalen] = '\0';
+                reply->len = datalen;
+                break;
+            case RESPB_RESP_INTEGER:
+                reply->type = VALKEY_REPLY_INTEGER;
+                reply->integer = respbGetInteger(data);
+                break;
+            case RESPB_RESP_BULK:
+                reply->type = VALKEY_REPLY_STRING;
+                reply->str = zmalloc(datalen + 1);
+                memcpy(reply->str, data, datalen);
+                reply->str[datalen] = '\0';
+                reply->len = datalen;
+                break;
+            case RESPB_RESP_NULL:
+                reply->type = VALKEY_REPLY_NIL;
+                break;
+            case RESPB_RESP_ARRAY:
+            case RESPB_RESP_MAP:
+                /* For now, just indicate it's an array/map */
+                reply->type = (type == RESPB_RESP_MAP) ? VALKEY_REPLY_MAP : VALKEY_REPLY_ARRAY;
+                reply->str = zstrdup("[RESPB array/map - detailed parsing not implemented]");
+                reply->len = strlen(reply->str);
+                break;
+            default:
+                reply->type = VALKEY_REPLY_STRING;
+                reply->str = zstrdup("[Unknown RESPB response type]");
+                reply->len = strlen(reply->str);
+            }
+            return reply;
+        }
+
+        if (buflen >= sizeof(buf)) {
+            fprintf(stderr, "Response too large\n");
+            return NULL;
+        }
+    }
+}
+
 static void resetConfig(void) {
     config.dbnum = 0;
     config.in_multi = 0;
@@ -1685,11 +1835,13 @@ static int cliConnect(int flags) {
 
         /* State of the current connection. */
         config.current_resp3 = 0;
+        config.current_respb = 0;
 
-        /* Do AUTH, select the right DB, switch to RESP3 if needed. */
+        /* Do AUTH, select the right DB, switch to RESP3/RESPB if needed. */
         if (cliAuth(context, config.conn_info.user, config.conn_info.auth) != VALKEY_OK) return VALKEY_ERR;
         if (cliSelect(&config, context) != VALKEY_OK) return VALKEY_ERR;
         if (cliSwitchProto() != VALKEY_OK) return VALKEY_ERR;
+        if (cliSwitchToRespb() != VALKEY_OK) return VALKEY_ERR;
     }
 
     /* Set a PUSH handler if configured to do so. */
@@ -2406,6 +2558,24 @@ static int cliSendCommand(int argc, char **argv, long repeat) {
     /* Negative repeat is allowed and causes infinite loop,
        works well with the interval option. */
     while (repeat < 0 || repeat-- > 0) {
+        /* Use RESPB path if in RESPB mode */
+        if (config.current_respb) {
+            valkeyReply *reply = cliRespbCommand(argc, argv);
+            if (reply == NULL) {
+                zfree(argvlen);
+                return VALKEY_ERR;
+            }
+            /* Output the reply */
+            sds out = cliFormatReplyRaw(reply);
+            if (out) {
+                fwrite(out, sdslen(out), 1, stdout);
+                sdsfree(out);
+            }
+            freeReplyObject(reply);
+            zfree(argvlen);
+            return VALKEY_OK;
+        }
+
         valkeyAppendCommandArgv(context, argc, (const char **)argv, argvlen);
 
         if (config.monitor_mode) {
@@ -2853,6 +3023,8 @@ static int parseOptions(int argc, char **argv) {
             config.resp2 = 1;
         } else if (!strcmp(argv[i], "-3")) {
             config.resp3 = 1;
+        } else if (!strcmp(argv[i], "-4")) {
+            config.respb = 1;
         } else if (!strcmp(argv[i], "--show-pushes") && !lastarg) {
             char *argval = argv[++i];
             if (!strncasecmp(argval, "n", 1)) {

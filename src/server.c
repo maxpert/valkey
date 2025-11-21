@@ -2093,21 +2093,25 @@ void createSharedObjects(void) {
     shared.null[1] = NULL;
     shared.null[2] = createSharedString("$-1\r\n");
     shared.null[3] = createSharedString("_\r\n");
+    shared.null[4] = createSharedString("_\r\n"); /* RESPB marker - handled specially in addReply */
 
     shared.nullarray[0] = NULL;
     shared.nullarray[1] = NULL;
     shared.nullarray[2] = createSharedString("*-1\r\n");
     shared.nullarray[3] = createSharedString("_\r\n");
+    shared.nullarray[4] = createSharedString("_\r\n"); /* RESPB marker */
 
     shared.emptymap[0] = NULL;
     shared.emptymap[1] = NULL;
     shared.emptymap[2] = createSharedString("*0\r\n");
     shared.emptymap[3] = createSharedString("%0\r\n");
+    shared.emptymap[4] = createSharedString("%0\r\n"); /* RESPB marker */
 
     shared.emptyset[0] = NULL;
     shared.emptyset[1] = NULL;
     shared.emptyset[2] = createSharedString("*0\r\n");
     shared.emptyset[3] = createSharedString("~0\r\n");
+    shared.emptyset[4] = createSharedString("~0\r\n"); /* RESPB marker */
 
     for (j = 0; j < PROTO_SHARED_SELECT_CMDS; j++) {
         char dictid_str[64];

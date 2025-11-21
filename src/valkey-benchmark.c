@@ -61,6 +61,7 @@
 #include "hdr_histogram.h"
 #include "cli_common.h"
 #include "mt19937-64.h"
+#include "respb.h"
 
 #define UNUSED(V) ((void)V)
 #define RANDPTR_INITIAL_SIZE 8
@@ -149,6 +150,7 @@ static struct config {
     pthread_mutex_t liveclients_mutex;
     pthread_mutex_t is_updating_slots_mutex;
     int resp3; /* use RESP3 */
+    int respb; /* use RESPB binary protocol */
     int rps;
     atomic_uint_fast64_t last_time_ns;
     uint64_t time_per_token;
@@ -184,6 +186,10 @@ typedef struct _client {
     int slots_last_update;
     uint64_t paused : 1;
     uint64_t reuse : 1;
+    /* RESPB-specific fields */
+    sds respb_ibuf;     /* RESPB input buffer */
+    size_t respb_ibuf_pos; /* Current position in RESPB input buffer */
+    size_t respb_cmd_len;  /* Length of single RESPB command (for placeholder replacement) */
 } *client;
 
 /* Threads. */
@@ -475,6 +481,9 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
     }
 }
 
+/* Forward declaration for RESPB placeholder replacement */
+static void replaceRespbPlaceholders(char *cmd_data, int cmd_count, size_t cmd_len);
+
 static void replacePlaceholders(char *cmd_data, int cmd_count) {
     static _Atomic uint64_t seq_key[PLACEHOLDER_COUNT] = {0};
 
@@ -528,6 +537,7 @@ static void freeClient(client c) {
     valkeyFree(c->context);
     if (c->paused) releasePausedClient(c);
     sdsfree(c->obuf);
+    if (c->respb_ibuf) sdsfree(c->respb_ibuf);
     zfree(c->stagptr);
     zfree(c);
     if (config.num_threads) pthread_mutex_lock(&(config.liveclients_mutex));
@@ -659,6 +669,109 @@ static void clientDone(client c) {
         config.liveclients++;
         if (config.num_threads) pthread_mutex_unlock(&(config.liveclients_mutex));
         freeClient(c);
+    }
+}
+
+/* RESPB protocol read handler */
+static void readHandlerRespb(aeEventLoop *el, int fd, void *privdata, int mask) {
+    client c = privdata;
+    UNUSED(el);
+    UNUSED(mask);
+
+    /* Calculate latency only for the first read event */
+    if (c->latency < 0) c->latency = ustime() - (c->start);
+
+    /* Read into buffer */
+    char buf[16384];
+    ssize_t nread = read(fd, buf, sizeof(buf));
+    if (nread <= 0) {
+        if (nread == 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+            fprintf(stderr, "Error: connection closed or read error\n");
+            exit(1);
+        }
+        return;
+    }
+
+    /* Append to RESPB input buffer */
+    if (!c->respb_ibuf) {
+        c->respb_ibuf = sdsnewlen(buf, nread);
+        c->respb_ibuf_pos = 0;
+    } else {
+        c->respb_ibuf = sdscatlen(c->respb_ibuf, buf, nread);
+    }
+
+    /* Parse RESPB responses */
+    while (c->pending) {
+        size_t buflen = sdslen(c->respb_ibuf) - c->respb_ibuf_pos;
+        if (buflen == 0) break;
+
+        uint16_t type, mux_id;
+        const char *data;
+        size_t datalen;
+        int consumed = respbParseResponse(c->respb_ibuf + c->respb_ibuf_pos, buflen,
+                                          &type, &mux_id, &data, &datalen);
+        if (consumed <= 0) break;  /* Need more data or error */
+
+        c->respb_ibuf_pos += consumed;
+
+        /* Check for error response */
+        if (type == RESPB_RESP_ERROR) {
+            fprintf(stderr, "Error from server: %.*s\n", (int)datalen, data);
+            exit(1);
+        }
+
+        /* Handle prefix commands (auth, select, hello) */
+        if (c->prefix_pending > 0) {
+            c->prefix_pending--;
+            c->pending--;
+            /* Discard prefix commands from obuf on first response */
+            if (c->prefixlen > 0) {
+                size_t j;
+                sdsrange(c->obuf, c->prefixlen, -1);
+                for (j = 0; j < c->staglen; j++) c->stagptr[j] -= c->prefixlen;
+                c->prefixlen = 0;
+            }
+            continue;
+        }
+
+        int requests_finished = atomic_fetch_add_explicit(&config.requests_finished, 1, memory_order_relaxed);
+        if (!isBenchmarkFinished(requests_finished)) {
+            if (config.num_threads == 0) {
+                hdr_record_value(config.latency_histogram,
+                                 (long)c->latency <= CONFIG_LATENCY_HISTOGRAM_MAX_VALUE
+                                     ? (long)c->latency
+                                     : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);
+                hdr_record_value(config.current_sec_latency_histogram,
+                                 (long)c->latency <= CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE
+                                     ? (long)c->latency
+                                     : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);
+            } else {
+                hdr_record_value_atomic(config.latency_histogram,
+                                        (long)c->latency <= CONFIG_LATENCY_HISTOGRAM_MAX_VALUE
+                                            ? (long)c->latency
+                                            : CONFIG_LATENCY_HISTOGRAM_MAX_VALUE);
+                hdr_record_value_atomic(config.current_sec_latency_histogram,
+                                        (long)c->latency <= CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE
+                                            ? (long)c->latency
+                                            : CONFIG_LATENCY_HISTOGRAM_INSTANT_MAX_VALUE);
+            }
+        }
+        c->pending--;
+        if (c->pending == 0) {
+            /* Compact the input buffer */
+            if (c->respb_ibuf_pos > 0) {
+                sdsrange(c->respb_ibuf, c->respb_ibuf_pos, -1);
+                c->respb_ibuf_pos = 0;
+            }
+            clientDone(c);
+            break;
+        }
+    }
+
+    /* Compact the input buffer periodically */
+    if (c->respb_ibuf_pos > 4096) {
+        sdsrange(c->respb_ibuf, c->respb_ibuf_pos, -1);
+        c->respb_ibuf_pos = 0;
     }
 }
 
@@ -859,7 +972,12 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
         }
 
         /* Really initialize: replace keys and set start time. */
-        if (config.replace_placeholders) replacePlaceholders(c->obuf + c->prefixlen, config.pipeline);
+        if (config.replace_placeholders) {
+            if (config.respb && c->respb_cmd_len > 0)
+                replaceRespbPlaceholders(c->obuf + c->prefixlen, config.pipeline, c->respb_cmd_len);
+            else
+                replacePlaceholders(c->obuf + c->prefixlen, config.pipeline);
+        }
         if (config.cluster_mode && c->staglen > 0) setClusterKeyHashTag(c);
         c->slots_last_update = atomic_load_explicit(&config.slots_last_update, memory_order_relaxed);
         c->start = ustime();
@@ -884,7 +1002,8 @@ static void writeHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
                 }
             } else {
                 aeDeleteFileEvent(el, c->context->fd, AE_WRITABLE);
-                aeCreateFileEvent(el, c->context->fd, AE_READABLE, readHandler, c);
+                aeFileProc *handler = config.respb ? readHandlerRespb : readHandler;
+                aeCreateFileEvent(el, c->context->fd, AE_READABLE, handler, c);
                 return;
             }
         }
@@ -956,6 +1075,9 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
     c->paused = 0;
     c->reuse = 0;
     c->thread_id = thread_id;
+    c->respb_ibuf = NULL;
+    c->respb_ibuf_pos = 0;
+    c->respb_cmd_len = (config.respb && seqlen == 1) ? (size_t)len : 0;
     /* Suppress libvalkey cleanup of unused buffers for max speed. */
     c->context->reader->maxbuf = 0;
 
@@ -1005,6 +1127,14 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         c->prefix_pending++;
     }
 
+    if (config.respb) {
+        char *buf = NULL;
+        int len = valkeyFormatCommand(&buf, "HELLO 4");
+        c->obuf = sdscatlen(c->obuf, buf, len);
+        free(buf);
+        c->prefix_pending++;
+    }
+
     if (config.cluster_mode && (config.read_from_replica == FROM_REPLICA_ONLY || config.read_from_replica == FROM_ALL)) {
         char *buf = NULL;
         int len;
@@ -1019,6 +1149,7 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
     if (from) {
         c->obuf = sdscatlen(c->obuf, from->obuf + from->prefixlen, sdslen(from->obuf) - from->prefixlen);
         seqlen = from->seqlen;
+        c->respb_cmd_len = from->respb_cmd_len;
     } else {
         for (int j = 0; j < config.pipeline; j++) c->obuf = sdscatlen(c->obuf, cmd, len);
     }
@@ -1069,9 +1200,11 @@ static client createClient(char *cmd, int len, int seqlen, client from, int thre
         if (config.ct != VALKEY_CONN_RDMA) {
             aeCreateFileEvent(el, c->context->fd, AE_WRITABLE, writeHandler, c);
         }
-    } else
+    } else {
         /* In idle mode, clients still need to register readHandler for catching errors */
-        aeCreateFileEvent(el, c->context->fd, AE_READABLE, readHandler, c);
+        aeFileProc *handler = config.respb ? readHandlerRespb : readHandler;
+        aeCreateFileEvent(el, c->context->fd, AE_READABLE, handler, c);
+    }
 
     listAddNodeTail(config.clients, c);
     atomic_fetch_add_explicit(&config.liveclients, 1, memory_order_relaxed);
@@ -1302,6 +1435,292 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
     if (config.current_sec_latency_histogram) hdr_close(config.current_sec_latency_histogram);
     if (config.latency_histogram) hdr_close(config.latency_histogram);
     if (config.rps_histogram) hdr_close(config.rps_histogram);
+}
+
+/* =============================================================================
+ * RESPB Command Template and Placeholder Support
+ * ============================================================================= */
+
+/* RESPB command template - stores argument strings with placeholders */
+typedef struct respbCmdTemplate {
+    int argc;
+    char **argv;           /* Original argument strings (with placeholders) */
+    size_t *argvlen;       /* Length of each argument */
+    /* Placeholder info per argument */
+    struct {
+        int placeholder_type;   /* -1 = no placeholder, 0-9 = placeholder index */
+        size_t placeholder_offset; /* Offset within the argument string */
+    } *arg_placeholders;
+} respbCmdTemplate;
+
+/* Global RESPB command template */
+static respbCmdTemplate respb_template = {0};
+
+/* Free RESPB template */
+static void freeRespbTemplate(void) {
+    if (respb_template.argv) {
+        for (int i = 0; i < respb_template.argc; i++) {
+            if (respb_template.argv[i]) zfree(respb_template.argv[i]);
+        }
+        zfree(respb_template.argv);
+    }
+    if (respb_template.argvlen) zfree(respb_template.argvlen);
+    if (respb_template.arg_placeholders) zfree(respb_template.arg_placeholders);
+    memset(&respb_template, 0, sizeof(respb_template));
+}
+
+/* Initialize RESPB template from format string (like valkeyFormatCommand).
+ * Supports placeholders: __rand_int__, __rand_1st__ through __rand_9th__
+ */
+static void initRespbTemplate(const char *format, ...) {
+    freeRespbTemplate();
+
+    /* First, format the command string using valkeyFormatCommand to get argc/argv */
+    va_list ap;
+    char *resp_cmd;
+    va_start(ap, format);
+    int resp_len = valkeyvFormatCommand(&resp_cmd, format, ap);
+    va_end(ap);
+
+    if (resp_len <= 0 || !resp_cmd) return;
+
+    /* Parse the RESP command to extract argc and argv */
+    /* RESP format: *<argc>\r\n$<len>\r\n<arg>\r\n... */
+    char *p = resp_cmd;
+    if (*p != '*') {
+        free(resp_cmd);
+        return;
+    }
+    p++;
+
+    int argc = atoi(p);
+    while (*p && *p != '\n') p++;
+    p++; /* skip \n */
+
+    respb_template.argc = argc;
+    respb_template.argv = zcalloc(sizeof(char *) * argc);
+    respb_template.argvlen = zcalloc(sizeof(size_t) * argc);
+    respb_template.arg_placeholders = zcalloc(sizeof(*respb_template.arg_placeholders) * argc);
+
+    for (int i = 0; i < argc; i++) {
+        if (*p != '$') break;
+        p++;
+        size_t len = atoi(p);
+        while (*p && *p != '\n') p++;
+        p++; /* skip \n */
+
+        respb_template.argv[i] = zmalloc(len + 1);
+        memcpy(respb_template.argv[i], p, len);
+        respb_template.argv[i][len] = '\0';
+        respb_template.argvlen[i] = len;
+
+        /* Scan for placeholders in this argument */
+        respb_template.arg_placeholders[i].placeholder_type = -1;
+        for (int ph = 0; ph < PLACEHOLDER_COUNT; ph++) {
+            char *found = strstr(respb_template.argv[i], PLACEHOLDERS[ph]);
+            if (found) {
+                respb_template.arg_placeholders[i].placeholder_type = ph;
+                respb_template.arg_placeholders[i].placeholder_offset = found - respb_template.argv[i];
+                break;
+            }
+        }
+
+        p += len;
+        if (*p == '\r') p++;
+        if (*p == '\n') p++;
+    }
+
+    free(resp_cmd);
+}
+
+/* Generate a single RESPB command with placeholder replacement.
+ * Returns allocated buffer (caller must zfree).
+ */
+static char *generateRespbCommand(size_t *outlen, _Atomic uint64_t *seq_keys) {
+    if (respb_template.argc == 0) return NULL;
+
+    /* Create temporary argv with placeholders replaced */
+    char *temp_argv[32];
+    size_t temp_argvlen[32];
+
+    for (int i = 0; i < respb_template.argc && i < 32; i++) {
+        int ph = respb_template.arg_placeholders[i].placeholder_type;
+        if (ph >= 0 && config.replace_placeholders) {
+            /* This argument has a placeholder - make a copy and replace */
+            temp_argv[i] = zmalloc(respb_template.argvlen[i] + 1);
+            memcpy(temp_argv[i], respb_template.argv[i], respb_template.argvlen[i] + 1);
+            temp_argvlen[i] = respb_template.argvlen[i];
+
+            /* Generate random key */
+            uint64_t key = 0;
+            if (config.keyspacelen != 0) {
+                if (config.sequential_replacement) {
+                    key = atomic_fetch_add_explicit(&seq_keys[ph], 1, memory_order_relaxed);
+                } else {
+                    key = random();
+                }
+                key %= config.keyspacelen;
+            }
+
+            /* Replace placeholder with zero-padded number */
+            size_t offset = respb_template.arg_placeholders[i].placeholder_offset;
+            char *p = temp_argv[i] + offset + PLACEHOLDER_LEN - 1;
+            for (size_t j = 0; j < PLACEHOLDER_LEN; j++) {
+                *p = '0' + key % 10;
+                key /= 10;
+                p--;
+            }
+        } else {
+            /* No placeholder - use original */
+            temp_argv[i] = respb_template.argv[i];
+            temp_argvlen[i] = respb_template.argvlen[i];
+        }
+    }
+
+    /* Format as RESPB */
+    char *cmd = respbFormatCommand(outlen, respb_template.argc,
+                                   (const char **)temp_argv, temp_argvlen);
+
+    /* Free temporary copies */
+    for (int i = 0; i < respb_template.argc && i < 32; i++) {
+        if (respb_template.arg_placeholders[i].placeholder_type >= 0 &&
+            config.replace_placeholders) {
+            zfree(temp_argv[i]);
+        }
+    }
+
+    return cmd;
+}
+
+/* Replace placeholders in RESPB command buffer (multiple pipelined commands).
+ * For RESPB, we need to regenerate commands since lengths change.
+ * This replaces the buffer contents in-place (same size due to fixed placeholder len).
+ */
+static void replaceRespbPlaceholders(char *cmd_data, int cmd_count, size_t cmd_len) {
+    static _Atomic uint64_t seq_keys[PLACEHOLDER_COUNT] = {0};
+
+    for (int i = 0; i < cmd_count; i++) {
+        size_t new_len;
+        char *new_cmd = generateRespbCommand(&new_len, seq_keys);
+        if (new_cmd && new_len == cmd_len) {
+            memcpy(cmd_data + i * cmd_len, new_cmd, cmd_len);
+        }
+        if (new_cmd) zfree(new_cmd);
+    }
+}
+
+/* Format a command for RESPB mode using valkeyFormatCommand-style format string.
+ * This initializes the template and returns the first command.
+ */
+static char *formatRespbCommand(int *outlen, const char *format, ...) {
+    va_list ap;
+    char *resp_cmd;
+
+    /* Format the command string */
+    va_start(ap, format);
+    int resp_len = valkeyvFormatCommand(&resp_cmd, format, ap);
+    va_end(ap);
+
+    if (resp_len <= 0 || !resp_cmd) {
+        *outlen = 0;
+        return NULL;
+    }
+
+    /* Parse RESP to get argc/argv, then format as RESPB */
+    char *p = resp_cmd;
+    if (*p != '*') {
+        free(resp_cmd);
+        *outlen = 0;
+        return NULL;
+    }
+    p++;
+
+    int argc = atoi(p);
+    while (*p && *p != '\n') p++;
+    p++;
+
+    const char *argv[32];
+    size_t argvlen[32];
+    char *arg_storage[32];
+
+    for (int i = 0; i < argc && i < 32; i++) {
+        if (*p != '$') break;
+        p++;
+        size_t len = atoi(p);
+        while (*p && *p != '\n') p++;
+        p++;
+
+        arg_storage[i] = zmalloc(len + 1);
+        memcpy(arg_storage[i], p, len);
+        arg_storage[i][len] = '\0';
+        argv[i] = arg_storage[i];
+        argvlen[i] = len;
+
+        p += len;
+        if (*p == '\r') p++;
+        if (*p == '\n') p++;
+    }
+
+    free(resp_cmd);
+
+    /* Format as RESPB */
+    size_t len;
+    char *cmd = respbFormatCommand(&len, argc, argv, argvlen);
+    *outlen = (int)len;
+
+    /* Free temporary storage */
+    for (int i = 0; i < argc && i < 32; i++) {
+        zfree(arg_storage[i]);
+    }
+
+    /* Also initialize the template for placeholder replacement */
+    freeRespbTemplate();
+    respb_template.argc = argc;
+    respb_template.argv = zcalloc(sizeof(char *) * argc);
+    respb_template.argvlen = zcalloc(sizeof(size_t) * argc);
+    respb_template.arg_placeholders = zcalloc(sizeof(*respb_template.arg_placeholders) * argc);
+
+    /* Re-parse to populate template (need to do this again since we freed resp_cmd) */
+    va_start(ap, format);
+    resp_len = valkeyvFormatCommand(&resp_cmd, format, ap);
+    va_end(ap);
+
+    if (resp_len > 0 && resp_cmd) {
+        p = resp_cmd + 1; /* skip * */
+        while (*p && *p != '\n') p++;
+        p++;
+
+        for (int i = 0; i < argc && i < 32; i++) {
+            if (*p != '$') break;
+            p++;
+            size_t len = atoi(p);
+            while (*p && *p != '\n') p++;
+            p++;
+
+            respb_template.argv[i] = zmalloc(len + 1);
+            memcpy(respb_template.argv[i], p, len);
+            respb_template.argv[i][len] = '\0';
+            respb_template.argvlen[i] = len;
+
+            /* Scan for placeholders */
+            respb_template.arg_placeholders[i].placeholder_type = -1;
+            for (int ph = 0; ph < PLACEHOLDER_COUNT; ph++) {
+                char *found = strstr(respb_template.argv[i], PLACEHOLDERS[ph]);
+                if (found) {
+                    respb_template.arg_placeholders[i].placeholder_type = ph;
+                    respb_template.arg_placeholders[i].placeholder_offset = found - respb_template.argv[i];
+                    break;
+                }
+            }
+
+            p += len;
+            if (*p == '\r') p++;
+            if (*p == '\n') p++;
+        }
+        free(resp_cmd);
+    }
+
+    return cmd;
 }
 
 /* Benchmark a single RESP-encoded command of length len. */
@@ -1693,6 +2112,8 @@ int parseOptions(int argc, char **argv) {
             config.input_dbnumstr = sdsfromlonglong(config.conn_info.input_dbnum);
         } else if (!strcmp(argv[i], "-3")) {
             config.resp3 = 1;
+        } else if (!strcmp(argv[i], "-4") || !strcmp(argv[i], "--respb")) {
+            config.respb = 1;
         } else if (!strcmp(argv[i], "-d")) {
             if (lastarg) goto invalid;
             config.datasize = atoi(argv[++i]);
@@ -1914,6 +2335,7 @@ usage:
         " -d <size>          Data size of SET/GET value in bytes (default 3)\n"
         " --dbnum <db>       SELECT the specified db number (default 0)\n"
         " -3                 Start session in RESP3 protocol mode.\n"
+        " -4, --respb        Start session in RESPB binary protocol mode.\n"
         " --threads <num>    Enable multi-thread mode.\n"
         " --cluster          Enable cluster mode.\n"
         "                    If the command is supplied on the command line in cluster\n"
@@ -2174,6 +2596,7 @@ int main(int argc, char **argv) {
     config.num_functions = 10;
     config.num_keys_in_fcall = 1;
     config.resp3 = 0;
+    config.respb = 0;
     resetPlaceholders();
 
     i = parseOptions(argc, argv);
@@ -2385,45 +2808,87 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("set")) {
-            len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
-            benchmark("SET", cmd, len);
-            free(cmd);
+            if (config.respb) {
+                cmd = formatRespbCommand(&len, "SET key%s:__rand_int__ %s", tag, data);
+                benchmark("SET", cmd, len);
+                zfree(cmd);
+            } else {
+                len = valkeyFormatCommand(&cmd, "SET key%s:__rand_int__ %s", tag, data);
+                benchmark("SET", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("get")) {
-            len = valkeyFormatCommand(&cmd, "GET key%s:__rand_int__", tag);
-            benchmark("GET", cmd, len);
-            free(cmd);
+            if (config.respb) {
+                cmd = formatRespbCommand(&len, "GET key%s:__rand_int__", tag);
+                benchmark("GET", cmd, len);
+                zfree(cmd);
+            } else {
+                len = valkeyFormatCommand(&cmd, "GET key%s:__rand_int__", tag);
+                benchmark("GET", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("incr")) {
-            len = valkeyFormatCommand(&cmd, "INCR counter%s:__rand_int__", tag);
-            benchmark("INCR", cmd, len);
-            free(cmd);
+            if (config.respb) {
+                cmd = formatRespbCommand(&len, "INCR counter%s:__rand_int__", tag);
+                benchmark("INCR", cmd, len);
+                zfree(cmd);
+            } else {
+                len = valkeyFormatCommand(&cmd, "INCR counter%s:__rand_int__", tag);
+                benchmark("INCR", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("lpush")) {
-            len = valkeyFormatCommand(&cmd, "LPUSH mylist%s %s", tag, data);
-            benchmark("LPUSH", cmd, len);
-            free(cmd);
+            if (config.respb) {
+                cmd = formatRespbCommand(&len, "LPUSH mylist%s %s", tag, data);
+                benchmark("LPUSH", cmd, len);
+                zfree(cmd);
+            } else {
+                len = valkeyFormatCommand(&cmd, "LPUSH mylist%s %s", tag, data);
+                benchmark("LPUSH", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("rpush")) {
-            len = valkeyFormatCommand(&cmd, "RPUSH mylist%s %s", tag, data);
-            benchmark("RPUSH", cmd, len);
-            free(cmd);
+            if (config.respb) {
+                cmd = formatRespbCommand(&len, "RPUSH mylist%s %s", tag, data);
+                benchmark("RPUSH", cmd, len);
+                zfree(cmd);
+            } else {
+                len = valkeyFormatCommand(&cmd, "RPUSH mylist%s %s", tag, data);
+                benchmark("RPUSH", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("lpop")) {
-            len = valkeyFormatCommand(&cmd, "LPOP mylist%s", tag);
-            benchmark("LPOP", cmd, len);
-            free(cmd);
+            if (config.respb) {
+                cmd = formatRespbCommand(&len, "LPOP mylist%s", tag);
+                benchmark("LPOP", cmd, len);
+                zfree(cmd);
+            } else {
+                len = valkeyFormatCommand(&cmd, "LPOP mylist%s", tag);
+                benchmark("LPOP", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("rpop")) {
-            len = valkeyFormatCommand(&cmd, "RPOP mylist%s", tag);
-            benchmark("RPOP", cmd, len);
-            free(cmd);
+            if (config.respb) {
+                cmd = formatRespbCommand(&len, "RPOP mylist%s", tag);
+                benchmark("RPOP", cmd, len);
+                zfree(cmd);
+            } else {
+                len = valkeyFormatCommand(&cmd, "RPOP mylist%s", tag);
+                benchmark("RPOP", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("sadd")) {
@@ -2433,9 +2898,15 @@ int main(int argc, char **argv) {
         }
 
         if (test_is_selected("hset")) {
-            len = valkeyFormatCommand(&cmd, "HSET myhash%s element:__rand_int__ %s", tag, data);
-            benchmark("HSET", cmd, len);
-            free(cmd);
+            if (config.respb) {
+                cmd = formatRespbCommand(&len, "HSET myhash%s element:__rand_int__ %s", tag, data);
+                benchmark("HSET", cmd, len);
+                zfree(cmd);
+            } else {
+                len = valkeyFormatCommand(&cmd, "HSET myhash%s element:__rand_int__ %s", tag, data);
+                benchmark("HSET", cmd, len);
+                free(cmd);
+            }
         }
 
         if (test_is_selected("spop")) {

@@ -93,6 +93,7 @@
 
 #define VALKEYMODULE_CORE 1
 typedef struct serverObject robj;
+#include "respb.h"
 #include "valkeymodule.h" /* Modules API defines. */
 
 /* Following includes allow test functions to be called from main() */
@@ -377,6 +378,7 @@ typedef enum blocking_type {
 /* Client request types */
 #define PROTO_REQ_INLINE 1
 #define PROTO_REQ_MULTIBULK 2
+#define PROTO_REQ_RESPB 3  /* RESPB binary protocol */
 
 /* Client classes for client limits, currently used only for
  * the max-client-output-buffer limit implementation. */
@@ -1317,7 +1319,9 @@ typedef struct client {
     uint16_t write_flags;            /* Client Write flags - used to communicate the client write state. */
     volatile uint8_t io_read_state;  /* Indicate the IO read state of the client */
     volatile uint8_t io_write_state; /* Indicate the IO write state of the client */
-    uint8_t resp;                    /* RESP protocol version. Can be 2 or 3. */
+    uint8_t resp;                    /* RESP protocol version. Can be 2, 3, or 4 (RESPB). */
+    uint16_t respb_mux_id;           /* RESPB multiplexing ID for current command */
+    uint16_t respb_opcode;           /* RESPB opcode for current command */
     uint8_t cur_tid;                 /* ID of IO thread currently performing IO for this client */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
@@ -1402,8 +1406,8 @@ struct sentinelConfig {
 };
 
 struct sharedObjectsStruct {
-    robj *ok, *err, *emptybulk, *czero, *cone, *pong, *space, *queued, *null[4], *nullarray[4], *emptymap[4],
-        *emptyset[4], *emptyarray, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr, *outofrangeerr, *noscripterr,
+    robj *ok, *err, *emptybulk, *czero, *cone, *pong, *space, *queued, *null[5], *nullarray[5], *emptymap[5],
+        *emptyset[5], *emptyarray, *wrongtypeerr, *nokeyerr, *syntaxerr, *sameobjecterr, *outofrangeerr, *noscripterr,
         *loadingerr, *slowevalerr, *slowscripterr, *slowmoduleerr, *bgsaveerr, *primarydownerr, *roreplicaerr,
         *loadingerr_variants[2], *slowevalerr_variants[2], *slowscripterr_variants[2], *slowmoduleerr_variants[2],
         *bgsaveerr_variants[2],
