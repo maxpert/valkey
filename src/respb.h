@@ -9,6 +9,7 @@
 #define __RESPB_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 /* RESPB Magic bytes for handshake */
 #define RESPB_MAGIC_BYTE1 0xD3
