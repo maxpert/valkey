@@ -16,8 +16,8 @@
 typedef struct respbOpcodeInfo {
     const char *cmd_name;      /* NULL if opcode not valid */
     int8_t fixed_argc;         /* -1 for variable arity, 0 if invalid */
-    robj *shared_name;         /* Shared robj for command name (server only) */
-    struct redisCommand *cmd;  /* Direct command pointer (server only) */
+    robj *shared_name;            /* Shared robj for command name (server only) */
+    struct serverCommand *cmd;    /* Direct command pointer (server only) */
 } respbOpcodeInfo;
 
 /* Direct lookup table - indexed by opcode for O(1) access */
@@ -184,7 +184,7 @@ void respbInitServer(void) {
 }
 
 /* Get cached command for opcode - O(1), no string lookup */
-struct redisCommand *respbOpcodeCommand(uint16_t opcode) {
+struct serverCommand *respbOpcodeCommand(uint16_t opcode) {
     if (opcode >= RESPB_OPCODE_TABLE_SIZE) return NULL;
     return opcodeTable[opcode].cmd;
 }
@@ -213,18 +213,22 @@ int respbOpcodeFixedArgc(uint16_t opcode) {
  * RESPB Request Parsing
  * ============================================================================= */
 
-/* Read a 2-byte length prefix from buffer */
+/* Read a 2-byte length prefix from buffer (handles unaligned access safely) */
 static inline int respbReadLen16(const char *buf, size_t buflen, size_t *pos, uint16_t *len) {
     if (*pos + 2 > buflen) return C_ERR;
-    *len = ntohs(*(uint16_t *)(buf + *pos));
+    uint16_t tmp;
+    memcpy(&tmp, buf + *pos, sizeof(tmp));
+    *len = ntohs(tmp);
     *pos += 2;
     return C_OK;
 }
 
-/* Read a 4-byte length prefix from buffer */
+/* Read a 4-byte length prefix from buffer (handles unaligned access safely) */
 static inline int respbReadLen32(const char *buf, size_t buflen, size_t *pos, uint32_t *len) {
     if (*pos + 4 > buflen) return C_ERR;
-    *len = ntohl(*(uint32_t *)(buf + *pos));
+    uint32_t tmp;
+    memcpy(&tmp, buf + *pos, sizeof(tmp));
+    *len = ntohl(tmp);
     *pos += 4;
     return C_OK;
 }
@@ -269,9 +273,12 @@ int parseRespbBuffer(client *c) {
     /* Need at least header size */
     if (qblen - pos < RESPB_HEADER_SIZE) return 0;
 
-    /* Read header */
-    uint16_t opcode = ntohs(*(uint16_t *)(buf + pos));
-    uint16_t mux_id = ntohs(*(uint16_t *)(buf + pos + 2));
+    /* Read header (using memcpy for safe unaligned access) */
+    uint16_t opcode_raw, mux_id_raw;
+    memcpy(&opcode_raw, buf + pos, sizeof(opcode_raw));
+    memcpy(&mux_id_raw, buf + pos + 2, sizeof(mux_id_raw));
+    uint16_t opcode = ntohs(opcode_raw);
+    uint16_t mux_id = ntohs(mux_id_raw);
     pos += RESPB_HEADER_SIZE;
 
     /* Store mux_id and opcode for response */
@@ -281,7 +288,9 @@ int parseRespbBuffer(client *c) {
     /* Handle RESP passthrough */
     if (IS_RESPB_PASSTHROUGH_OPCODE(opcode)) {
         if (qblen - pos < 4) return 0;  /* Need RESP length */
-        uint32_t resp_len = ntohl(*(uint32_t *)(buf + pos));
+        uint32_t resp_len_raw;
+        memcpy(&resp_len_raw, buf + pos, sizeof(resp_len_raw));
+        uint32_t resp_len = ntohl(resp_len_raw);
         pos += 4;
 
         if (qblen - pos < resp_len) return 0;  /* Need full RESP data */
@@ -404,8 +413,10 @@ int parseRespbBuffer(client *c) {
 /* Add RESPB response header to output buffer */
 static void addRespbResponseHeader(client *c, uint16_t resp_opcode) {
     char header[4];
-    *(uint16_t *)header = htons(resp_opcode);
-    *(uint16_t *)(header + 2) = htons(c->respb_mux_id);
+    uint16_t opcode_net = htons(resp_opcode);
+    uint16_t mux_id_net = htons(c->respb_mux_id);
+    memcpy(header, &opcode_net, sizeof(opcode_net));
+    memcpy(header + 2, &mux_id_net, sizeof(mux_id_net));
     addReplyProto(c, header, 4);
 }
 
@@ -424,7 +435,8 @@ void addReplyRespbError(client *c, const char *err) {
         addRespbResponseHeader(c, RESPB_RESP_ERROR);
         uint16_t len = strlen(err);
         char lenbuf[2];
-        *(uint16_t *)lenbuf = htons(len);
+        uint16_t len_net = htons(len);
+        memcpy(lenbuf, &len_net, sizeof(len_net));
         addReplyProto(c, lenbuf, 2);
         addReplyProto(c, err, len);
     } else {
@@ -468,13 +480,16 @@ void addReplyRespbBulkCBuffer(client *c, const void *p, size_t len) {
         addRespbResponseHeader(c, RESPB_RESP_BULK);
         if (len < 0xFFFF) {
             char lenbuf[2];
-            *(uint16_t *)lenbuf = htons((uint16_t)len);
+            uint16_t len_net = htons((uint16_t)len);
+            memcpy(lenbuf, &len_net, sizeof(len_net));
             addReplyProto(c, lenbuf, 2);
         } else {
             /* Large string marker + 4-byte length */
             char lenbuf[6];
-            *(uint16_t *)lenbuf = htons(0xFFFF);
-            *(uint32_t *)(lenbuf + 2) = htonl((uint32_t)len);
+            uint16_t marker = htons(0xFFFF);
+            uint32_t len_net = htonl((uint32_t)len);
+            memcpy(lenbuf, &marker, sizeof(marker));
+            memcpy(lenbuf + 2, &len_net, sizeof(len_net));
             addReplyProto(c, lenbuf, 6);
         }
         addReplyProto(c, p, len);
@@ -499,12 +514,15 @@ void addReplyRespbArrayLen(client *c, long length) {
         addRespbResponseHeader(c, RESPB_RESP_ARRAY);
         if (length < 0xFFFF) {
             char lenbuf[2];
-            *(uint16_t *)lenbuf = htons((uint16_t)length);
+            uint16_t len_net = htons((uint16_t)length);
+            memcpy(lenbuf, &len_net, sizeof(len_net));
             addReplyProto(c, lenbuf, 2);
         } else {
             char lenbuf[6];
-            *(uint16_t *)lenbuf = htons(0xFFFF);
-            *(uint32_t *)(lenbuf + 2) = htonl((uint32_t)length);
+            uint16_t marker = htons(0xFFFF);
+            uint32_t len_net = htonl((uint32_t)length);
+            memcpy(lenbuf, &marker, sizeof(marker));
+            memcpy(lenbuf + 2, &len_net, sizeof(len_net));
             addReplyProto(c, lenbuf, 6);
         }
     } else {
@@ -518,12 +536,15 @@ void addReplyRespbMapLen(client *c, long length) {
         addRespbResponseHeader(c, RESPB_RESP_MAP);
         if (length < 0xFFFF) {
             char lenbuf[2];
-            *(uint16_t *)lenbuf = htons((uint16_t)length);
+            uint16_t len_net = htons((uint16_t)length);
+            memcpy(lenbuf, &len_net, sizeof(len_net));
             addReplyProto(c, lenbuf, 2);
         } else {
             char lenbuf[6];
-            *(uint16_t *)lenbuf = htons(0xFFFF);
-            *(uint32_t *)(lenbuf + 2) = htonl((uint32_t)length);
+            uint16_t marker = htons(0xFFFF);
+            uint32_t len_net = htonl((uint32_t)length);
+            memcpy(lenbuf, &marker, sizeof(marker));
+            memcpy(lenbuf + 2, &len_net, sizeof(len_net));
             addReplyProto(c, lenbuf, 6);
         }
     } else {
@@ -547,8 +568,9 @@ void addReplyRespbDouble(client *c, double d) {
     if (c->resp == PROTO_RESPB) {
         addRespbResponseHeader(c, RESPB_RESP_DOUBLE);
         char buf[8];
-        uint64_t *ptr = (uint64_t *)&d;
-        uint64_t val = *ptr;
+        uint64_t val;
+        /* Use memcpy for type punning to avoid strict aliasing violation */
+        memcpy(&val, &d, sizeof(val));
         /* Network byte order */
         buf[0] = (val >> 56) & 0xFF;
         buf[1] = (val >> 48) & 0xFF;
@@ -569,12 +591,15 @@ void addReplyRespbBulkElement(client *c, const void *p, size_t len) {
     if (c->resp == PROTO_RESPB) {
         if (len < 0xFFFF) {
             char lenbuf[2];
-            *(uint16_t *)lenbuf = htons((uint16_t)len);
+            uint16_t len_net = htons((uint16_t)len);
+            memcpy(lenbuf, &len_net, sizeof(len_net));
             addReplyProto(c, lenbuf, 2);
         } else {
             char lenbuf[6];
-            *(uint16_t *)lenbuf = htons(0xFFFF);
-            *(uint32_t *)(lenbuf + 2) = htonl((uint32_t)len);
+            uint16_t marker = htons(0xFFFF);
+            uint32_t len_net = htonl((uint32_t)len);
+            memcpy(lenbuf, &marker, sizeof(marker));
+            memcpy(lenbuf + 2, &len_net, sizeof(len_net));
             addReplyProto(c, lenbuf, 6);
         }
         addReplyProto(c, p, len);
@@ -587,9 +612,10 @@ void addReplyRespbBulkElement(client *c, const void *p, size_t len) {
 void addReplyRespbNullElement(client *c) {
     if (c->resp == PROTO_RESPB) {
         /* Use special length marker 0xFFFE for null */
-        char marker[2];
-        *(uint16_t *)marker = htons(0xFFFE);
-        addReplyProto(c, marker, 2);
+        char marker_buf[2];
+        uint16_t marker = htons(0xFFFE);
+        memcpy(marker_buf, &marker, sizeof(marker));
+        addReplyProto(c, marker_buf, 2);
     } else {
         addReplyNull(c);
     }
@@ -600,7 +626,8 @@ void addReplyRespbLongLongElement(client *c, long long ll) {
     if (c->resp == PROTO_RESPB) {
         /* Use special marker 0xFFFD followed by 8-byte int */
         char buf[10];
-        *(uint16_t *)buf = htons(0xFFFD);
+        uint16_t marker = htons(0xFFFD);
+        memcpy(buf, &marker, sizeof(marker));
         int64_t val = ll;
         buf[2] = (val >> 56) & 0xFF;
         buf[3] = (val >> 48) & 0xFF;
@@ -682,15 +709,18 @@ char *respbFormatCommand(size_t *len, int argc, const char **argv, const size_t 
 
     char *p = buf;
 
-    /* Write header */
-    *(uint16_t *)p = htons(opcode);
+    /* Write header (using memcpy for safe unaligned access) */
+    uint16_t opcode_net = htons(opcode);
+    uint16_t mux_id_net = htons(0);  /* mux_id = 0 for now */
+    memcpy(p, &opcode_net, sizeof(opcode_net));
     p += 2;
-    *(uint16_t *)p = htons(0);  /* mux_id = 0 for now */
+    memcpy(p, &mux_id_net, sizeof(mux_id_net));
     p += 2;
 
     /* Write argc for variable arity commands */
     if (fixed_argc < 0) {
-        *(uint16_t *)p = htons((uint16_t)(argc - 1));  /* exclude command name */
+        uint16_t argc_net = htons((uint16_t)(argc - 1));  /* exclude command name */
+        memcpy(p, &argc_net, sizeof(argc_net));
         p += 2;
     }
 
@@ -698,12 +728,15 @@ char *respbFormatCommand(size_t *len, int argc, const char **argv, const size_t 
     for (int i = 1; i < argc; i++) {
         size_t arglen = argvlen ? argvlen[i] : strlen(argv[i]);
         if (arglen < 0xFFFF) {
-            *(uint16_t *)p = htons((uint16_t)arglen);
+            uint16_t len_net = htons((uint16_t)arglen);
+            memcpy(p, &len_net, sizeof(len_net));
             p += 2;
         } else {
-            *(uint16_t *)p = htons(0xFFFF);
+            uint16_t marker = htons(0xFFFF);
+            uint32_t len_net = htonl((uint32_t)arglen);
+            memcpy(p, &marker, sizeof(marker));
             p += 2;
-            *(uint32_t *)p = htonl((uint32_t)arglen);
+            memcpy(p, &len_net, sizeof(len_net));
             p += 4;
         }
         memcpy(p, argv[i], arglen);
@@ -728,8 +761,12 @@ int respbParseResponse(const char *buf, size_t buflen,
                        const char **data, size_t *datalen) {
     if (buflen < 4) return 0;  /* Need at least header */
 
-    uint16_t resp_opcode = ntohs(*(uint16_t *)buf);
-    *mux_id = ntohs(*(uint16_t *)(buf + 2));
+    /* Read header using memcpy for safe unaligned access */
+    uint16_t opcode_raw, mux_id_raw;
+    memcpy(&opcode_raw, buf, sizeof(opcode_raw));
+    memcpy(&mux_id_raw, buf + 2, sizeof(mux_id_raw));
+    uint16_t resp_opcode = ntohs(opcode_raw);
+    *mux_id = ntohs(mux_id_raw);
     *type = resp_opcode;
 
     size_t pos = 4;
@@ -772,14 +809,18 @@ int respbParseResponse(const char *buf, size_t buflen,
     case RESPB_RESP_BULK: {
         /* Length-prefixed string */
         if (buflen < pos + 2) return 0;
-        uint16_t len16 = ntohs(*(uint16_t *)(buf + pos));
+        uint16_t len16_raw;
+        memcpy(&len16_raw, buf + pos, sizeof(len16_raw));
+        uint16_t len16 = ntohs(len16_raw);
         pos += 2;
 
         size_t len;
         if (len16 == 0xFFFF) {
             /* Large string */
             if (buflen < pos + 4) return 0;
-            len = ntohl(*(uint32_t *)(buf + pos));
+            uint32_t len32_raw;
+            memcpy(&len32_raw, buf + pos, sizeof(len32_raw));
+            len = ntohl(len32_raw);
             pos += 4;
         } else if (len16 == 0xFFFE) {
             /* Null marker */
@@ -801,13 +842,17 @@ int respbParseResponse(const char *buf, size_t buflen,
         /* For benchmark purposes, we just need to consume the response.
          * Elements may have full headers (opcode+mux_id) or just length+data. */
         if (buflen < pos + 2) return 0;
-        uint16_t count16 = ntohs(*(uint16_t *)(buf + pos));
+        uint16_t count16_raw;
+        memcpy(&count16_raw, buf + pos, sizeof(count16_raw));
+        uint16_t count16 = ntohs(count16_raw);
         pos += 2;
 
         size_t count;
         if (count16 == 0xFFFF) {
             if (buflen < pos + 4) return 0;
-            count = ntohl(*(uint32_t *)(buf + pos));
+            uint32_t count32_raw;
+            memcpy(&count32_raw, buf + pos, sizeof(count32_raw));
+            count = ntohl(count32_raw);
             pos += 4;
         } else {
             count = count16;
@@ -819,7 +864,9 @@ int respbParseResponse(const char *buf, size_t buflen,
         /* Consume elements - they may be nested RESPB responses */
         for (size_t i = 0; i < count; i++) {
             if (buflen < pos + 2) return 0;
-            uint16_t elem_header = ntohs(*(uint16_t *)(buf + pos));
+            uint16_t elem_header_raw;
+            memcpy(&elem_header_raw, buf + pos, sizeof(elem_header_raw));
+            uint16_t elem_header = ntohs(elem_header_raw);
 
             /* Check if element starts with a response opcode (0x80xx) */
             if ((elem_header & 0x8000) != 0) {
@@ -836,7 +883,9 @@ int respbParseResponse(const char *buf, size_t buflen,
                 /* Large element */
                 pos += 2;
                 if (buflen < pos + 4) return 0;
-                size_t elen = ntohl(*(uint32_t *)(buf + pos));
+                uint32_t elen_raw;
+                memcpy(&elen_raw, buf + pos, sizeof(elen_raw));
+                size_t elen = ntohl(elen_raw);
                 pos += 4;
                 if (buflen < pos + elen) return 0;
                 pos += elen;

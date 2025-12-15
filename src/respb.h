@@ -357,7 +357,7 @@ void respbInitServer(void);
 int parseRespbBuffer(struct client *c);
 const char *respbOpcodeToCommand(uint16_t opcode);
 int respbOpcodeFixedArgc(uint16_t opcode);
-struct redisCommand *respbOpcodeCommand(uint16_t opcode);
+struct serverCommand *respbOpcodeCommand(uint16_t opcode);
 struct serverObject *respbOpcodeSharedName(uint16_t opcode);
 
 /* Response functions - RESPB-aware wrappers */
