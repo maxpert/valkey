@@ -344,6 +344,46 @@ typedef struct respbResponseHeader {
 #define PROTO_REQ_RESPB 3
 
 /* =============================================================================
+ * RESPB Command Encoding Infrastructure
+ * ============================================================================= */
+
+/* Encoding types - defines payload format after the 4-byte header */
+typedef enum respbEncType {
+    RESPB_ENC_GENERIC = 0,    /* Fallback: [count:2B][len:2B][arg]... */
+    RESPB_ENC_KEY_ONLY,       /* GET, INCR: [keylen:2B][key] */
+    RESPB_ENC_KEY_VALUE,      /* SET: [keylen:2B][key][vallen:4B][value][flags:1B] */
+    RESPB_ENC_KEY_ELEMENTS,   /* LPUSH, RPUSH: [keylen:2B][key][count:2B]([len:2B][elem])... */
+    RESPB_ENC_KEY_OPTCOUNT,   /* LPOP, RPOP: [keylen:2B][key][count?:2B] */
+    RESPB_ENC_KEY_PAIRS,      /* HSET: [keylen:2B][key][count:2B]([flen:2B][f][vlen:4B][v])... */
+} respbEncType;
+
+/* Encoder function pointer - client-side formatting */
+typedef char *(*respbEncoderFunc)(size_t *outlen, int argc,
+                                   const char **argv, const size_t *argvlen);
+
+/* Decoder function pointer - server-side parsing */
+typedef int (*respbDecoderFunc)(struct client *c, const char *buf,
+                                 size_t buflen, size_t *pos);
+
+/* SET command flags (for RESPB_ENC_KEY_VALUE) */
+#define RESPB_SET_FLAG_NX    0x01  /* Only set if not exists */
+#define RESPB_SET_FLAG_XX    0x02  /* Only set if exists */
+#define RESPB_SET_FLAG_EX    0x10  /* 8B expiry field present (seconds) */
+#define RESPB_SET_FLAG_PX    0x20  /* 8B expiry field present (milliseconds) */
+
+/* Opcode table size */
+#define RESPB_OPCODE_TABLE_SIZE 65536
+
+/* Opcode information structure */
+typedef struct respbOpcodeInfo {
+    const char *cmd_name;        /* Command name (e.g., "GET", "SET") */
+    int8_t fixed_argc;           /* Fixed arg count, or -1 for variable arity */
+    uint8_t enc_type;            /* respbEncType - encoding pattern */
+    respbEncoderFunc encoder;    /* Client encoder (NULL = use generic) */
+    respbDecoderFunc decoder;    /* Server decoder (NULL = use generic) */
+} respbOpcodeInfo;
+
+/* =============================================================================
  * RESPB Function Declarations
  * ============================================================================= */
 
