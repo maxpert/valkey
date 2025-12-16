@@ -2557,9 +2557,11 @@ static void writeToReplica(client *c) {
     c->nwritten = totwritten;
 }
 
-/* Bulk string reply requires 3 iov entries -
- * length prefix ($<length>\r\n), string (<data>) and suffix (\r\n) */
-#define NUM_OF_IOV_PER_BULK_STR 3
+/* Bulk string reply requires 2-3 iov entries:
+ * - RESP: prefix ($<len>\r\n) + data + suffix (\r\n) = 3 iovs
+ * - RESPB: prefix (header+len) + data = 2 iovs
+ * Use minimum (2) for sizing prefix array to handle both cases */
+#define NUM_OF_IOV_PER_BULK_STR 2
 /* Bulk string prefix max size (long + $ + \r\n) */
 #define BULK_STR_LEN_PREFIX_MAX_SIZE (LONG_STR_SIZE + 3)
 
