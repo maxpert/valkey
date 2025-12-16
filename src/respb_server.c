@@ -22,9 +22,97 @@ typedef struct respbServerOpcodeInfo {
 static respbServerOpcodeInfo serverOpcodeTable[RESPB_OPCODE_TABLE_SIZE];
 static int serverOpcodeTableInitialized = 0;
 
+/* =============================================================================
+ * Pre-allocated Shared RESPB Response Buffers
+ *
+ * These are pre-computed response headers/buffers to avoid per-response
+ * computation overhead. Used when mux_id=0 (the common case for benchmarks).
+ * ============================================================================= */
+
+/* Pre-computed 4-byte headers (opcode + mux_id=0) */
+static char shared_respb_ok[4];       /* RESPB_RESP_OK header */
+static char shared_respb_null[4];     /* RESPB_RESP_NULL header */
+static char shared_respb_integer_hdr[4];  /* RESPB_RESP_INTEGER header */
+static char shared_respb_bulk_hdr[4];     /* RESPB_RESP_BULK header */
+static char shared_respb_array_hdr[4];    /* RESPB_RESP_ARRAY header */
+static char shared_respb_bool_hdr[4];     /* RESPB_RESP_BOOL header */
+static char shared_respb_map_hdr[4];      /* RESPB_RESP_MAP header */
+static char shared_respb_double_hdr[4];   /* RESPB_RESP_DOUBLE header */
+
+/* Pre-computed complete responses for common integer values */
+static char shared_respb_czero[12];   /* Complete integer 0 response (header + 8 bytes) */
+static char shared_respb_cone[12];    /* Complete integer 1 response (header + 8 bytes) */
+static char shared_respb_cnegone[12]; /* Complete integer -1 response (header + 8 bytes) */
+
+/* Pre-computed boolean responses (header + 1 byte value) */
+static char shared_respb_true[5];     /* Complete boolean true response */
+static char shared_respb_false[5];    /* Complete boolean false response */
+
+static int sharedRespbResponsesInitialized = 0;
+
+/* Helper to build a 4-byte header with mux_id=0 */
+static inline void buildRespbHeader(char *buf, uint16_t opcode) {
+    uint16_t opcode_net = htons(opcode);
+    memcpy(buf, &opcode_net, 2);
+    buf[2] = 0;  /* mux_id = 0 */
+    buf[3] = 0;
+}
+
+/* Helper to encode 64-bit integer in network byte order */
+static inline void encodeInt64BE(char *buf, int64_t val) {
+    buf[0] = (val >> 56) & 0xFF;
+    buf[1] = (val >> 48) & 0xFF;
+    buf[2] = (val >> 40) & 0xFF;
+    buf[3] = (val >> 32) & 0xFF;
+    buf[4] = (val >> 24) & 0xFF;
+    buf[5] = (val >> 16) & 0xFF;
+    buf[6] = (val >> 8) & 0xFF;
+    buf[7] = val & 0xFF;
+}
+
+/* Initialize shared response buffers - called once at startup */
+static void initSharedRespbResponses(void) {
+    if (sharedRespbResponsesInitialized) return;
+
+    /* Build 4-byte headers */
+    buildRespbHeader(shared_respb_ok, RESPB_RESP_OK);
+    buildRespbHeader(shared_respb_null, RESPB_RESP_NULL);
+    buildRespbHeader(shared_respb_integer_hdr, RESPB_RESP_INTEGER);
+    buildRespbHeader(shared_respb_bulk_hdr, RESPB_RESP_BULK);
+    buildRespbHeader(shared_respb_array_hdr, RESPB_RESP_ARRAY);
+    buildRespbHeader(shared_respb_bool_hdr, RESPB_RESP_BOOL);
+    buildRespbHeader(shared_respb_map_hdr, RESPB_RESP_MAP);
+    buildRespbHeader(shared_respb_double_hdr, RESPB_RESP_DOUBLE);
+
+    /* Build complete integer 0 response: header + 8 bytes (0) */
+    memcpy(shared_respb_czero, shared_respb_integer_hdr, 4);
+    memset(shared_respb_czero + 4, 0, 8);  /* 64-bit zero */
+
+    /* Build complete integer 1 response: header + 8 bytes (1) */
+    memcpy(shared_respb_cone, shared_respb_integer_hdr, 4);
+    encodeInt64BE(shared_respb_cone + 4, 1);
+
+    /* Build complete integer -1 response: header + 8 bytes (-1) */
+    memcpy(shared_respb_cnegone, shared_respb_integer_hdr, 4);
+    encodeInt64BE(shared_respb_cnegone + 4, -1);
+
+    /* Build boolean true response: header + 1 byte (1) */
+    memcpy(shared_respb_true, shared_respb_bool_hdr, 4);
+    shared_respb_true[4] = 1;
+
+    /* Build boolean false response: header + 1 byte (0) */
+    memcpy(shared_respb_false, shared_respb_bool_hdr, 4);
+    shared_respb_false[4] = 0;
+
+    sharedRespbResponsesInitialized = 1;
+}
+
 /* Server-only initialization - creates shared objects and resolves commands */
 void respbInitServer(void) {
     if (serverOpcodeTableInitialized) return;
+
+    /* Initialize shared response buffers */
+    initSharedRespbResponses();
 
     /* Ensure base opcode table is initialized first */
     respbOpcodeToCommand(0);  /* This triggers initOpcodeTable() */
@@ -601,6 +689,9 @@ int parseRespbBuffer(client *c) {
     c->respb_mux_id = mux_id;
     c->respb_opcode = opcode;
 
+    /* CRITICAL: Set response protocol to RESPB so reply functions use binary format */
+    c->resp = PROTO_RESPB;
+
     /* Handle RESP passthrough */
     if (IS_RESPB_PASSTHROUGH_OPCODE(opcode)) {
         if (qblen - pos < 4) return 0;  /* Need RESP length */
@@ -859,7 +950,12 @@ static void addRespbResponseHeader(client *c, uint16_t resp_opcode) {
 /* Reply with OK status in RESPB format */
 void addReplyRespbOK(client *c) {
     if (c->resp == PROTO_RESPB) {
-        addRespbResponseHeader(c, RESPB_RESP_OK);
+        if (c->respb_mux_id == 0) {
+            /* Fast path: use pre-computed header */
+            addReplyProto(c, shared_respb_ok, 4);
+        } else {
+            addRespbResponseHeader(c, RESPB_RESP_OK);
+        }
     } else {
         addReply(c, shared.ok);
     }
@@ -883,19 +979,30 @@ void addReplyRespbError(client *c, const char *err) {
 /* Reply with integer in RESPB format */
 void addReplyRespbLongLong(client *c, long long ll) {
     if (c->resp == PROTO_RESPB) {
-        addRespbResponseHeader(c, RESPB_RESP_INTEGER);
-        char buf[8];
-        int64_t val = ll;
-        /* Network byte order for 64-bit */
-        buf[0] = (val >> 56) & 0xFF;
-        buf[1] = (val >> 48) & 0xFF;
-        buf[2] = (val >> 40) & 0xFF;
-        buf[3] = (val >> 32) & 0xFF;
-        buf[4] = (val >> 24) & 0xFF;
-        buf[5] = (val >> 16) & 0xFF;
-        buf[6] = (val >> 8) & 0xFF;
-        buf[7] = val & 0xFF;
-        addReplyProto(c, buf, 8);
+        if (c->respb_mux_id == 0) {
+            /* Fast path: use pre-computed responses for common values */
+            if (ll == 0) {
+                addReplyProto(c, shared_respb_czero, 12);
+                return;
+            } else if (ll == 1) {
+                addReplyProto(c, shared_respb_cone, 12);
+                return;
+            } else if (ll == -1) {
+                addReplyProto(c, shared_respb_cnegone, 12);
+                return;
+            }
+            /* Optimized path: build complete response in single buffer */
+            char buf[12];  /* header (4) + int64 (8) */
+            memcpy(buf, shared_respb_integer_hdr, 4);
+            encodeInt64BE(buf + 4, ll);
+            addReplyProto(c, buf, 12);
+        } else {
+            /* Fallback for mux_id != 0 */
+            addRespbResponseHeader(c, RESPB_RESP_INTEGER);
+            char buf[8];
+            encodeInt64BE(buf, ll);
+            addReplyProto(c, buf, 8);
+        }
     } else {
         addReplyLongLong(c, ll);
     }
@@ -904,7 +1011,12 @@ void addReplyRespbLongLong(client *c, long long ll) {
 /* Reply with null in RESPB format */
 void addReplyRespbNull(client *c) {
     if (c->resp == PROTO_RESPB) {
-        addRespbResponseHeader(c, RESPB_RESP_NULL);
+        if (c->respb_mux_id == 0) {
+            /* Fast path: use pre-computed header */
+            addReplyProto(c, shared_respb_null, 4);
+        } else {
+            addRespbResponseHeader(c, RESPB_RESP_NULL);
+        }
     } else {
         addReplyNull(c);
     }
@@ -913,22 +1025,44 @@ void addReplyRespbNull(client *c) {
 /* Reply with bulk string in RESPB format */
 void addReplyRespbBulkCBuffer(client *c, const void *p, size_t len) {
     if (c->resp == PROTO_RESPB) {
-        addRespbResponseHeader(c, RESPB_RESP_BULK);
-        if (len < 0xFFFF) {
+        if (c->respb_mux_id == 0 && len < 0xFFFF) {
+            /* Fast path for small strings: single write for header+length+data */
+            if (len <= 256) {
+                /* Very small values: combine everything into one write */
+                char buf[6 + 256];  /* header (4) + length (2) + data (up to 256) */
+                memcpy(buf, shared_respb_bulk_hdr, 4);
+                uint16_t len_net = htons((uint16_t)len);
+                memcpy(buf + 4, &len_net, 2);
+                memcpy(buf + 6, p, len);
+                addReplyProto(c, buf, 6 + len);
+            } else {
+                /* Larger values: two writes (header+len, then data) */
+                char buf[6];  /* header (4) + length (2) */
+                memcpy(buf, shared_respb_bulk_hdr, 4);
+                uint16_t len_net = htons((uint16_t)len);
+                memcpy(buf + 4, &len_net, 2);
+                addReplyProto(c, buf, 6);
+                addReplyProto(c, p, len);
+            }
+        } else if (len < 0xFFFF) {
+            /* Small string with mux_id != 0 */
+            addRespbResponseHeader(c, RESPB_RESP_BULK);
             char lenbuf[2];
             uint16_t len_net = htons((uint16_t)len);
-            memcpy(lenbuf, &len_net, sizeof(len_net));
+            memcpy(lenbuf, &len_net, 2);
             addReplyProto(c, lenbuf, 2);
+            addReplyProto(c, p, len);
         } else {
-            /* Large string marker + 4-byte length */
+            /* Large string: marker + 4-byte length */
+            addRespbResponseHeader(c, RESPB_RESP_BULK);
             char lenbuf[6];
             uint16_t marker = htons(0xFFFF);
             uint32_t len_net = htonl((uint32_t)len);
-            memcpy(lenbuf, &marker, sizeof(marker));
-            memcpy(lenbuf + 2, &len_net, sizeof(len_net));
+            memcpy(lenbuf, &marker, 2);
+            memcpy(lenbuf + 2, &len_net, 4);
             addReplyProto(c, lenbuf, 6);
+            addReplyProto(c, p, len);
         }
-        addReplyProto(c, p, len);
     } else {
         addReplyBulkCBuffer(c, p, len);
     }
@@ -937,8 +1071,26 @@ void addReplyRespbBulkCBuffer(client *c, const void *p, size_t len) {
 /* Reply with bulk string from robj in RESPB format */
 void addReplyRespbBulk(client *c, robj *obj) {
     if (c->resp == PROTO_RESPB) {
-        sds s = obj->ptr;
-        addReplyRespbBulkCBuffer(c, s, sdslen(s));
+        /* Try zero-copy path for RAW encoding - avoids copying string data */
+        if (obj->encoding == OBJ_ENCODING_RAW && obj->refcount != OBJ_STATIC_REFCOUNT) {
+            /* Use zero-copy: store pointer reference, build header at I/O time */
+            uint16_t opcode_net = htons(RESPB_RESP_BULK);
+            uint16_t mux_id_net = htons(c->respb_mux_id);
+            addReplyRespbBulkZeroCopy(c, obj, opcode_net, mux_id_net);
+            return;
+        }
+        if (sdsEncodedObject(obj)) {
+            /* EMBSTR encoding - ptr is an sds but not suitable for zero-copy */
+            sds s = obj->ptr;
+            addReplyRespbBulkCBuffer(c, s, sdslen(s));
+        } else if (obj->encoding == OBJ_ENCODING_INT) {
+            /* INT encoding - ptr is actually a long value */
+            char buf[32];
+            int len = ll2string(buf, sizeof(buf), (long)obj->ptr);
+            addReplyRespbBulkCBuffer(c, buf, len);
+        } else {
+            serverPanic("Unknown string encoding in addReplyRespbBulk");
+        }
     } else {
         addReplyBulk(c, obj);
     }
@@ -947,18 +1099,26 @@ void addReplyRespbBulk(client *c, robj *obj) {
 /* Start array reply in RESPB format */
 void addReplyRespbArrayLen(client *c, long length) {
     if (c->resp == PROTO_RESPB) {
-        addRespbResponseHeader(c, RESPB_RESP_ARRAY);
-        if (length < 0xFFFF) {
+        if (c->respb_mux_id == 0 && length < 0xFFFF) {
+            /* Fast path: batch header + length into single call */
+            char buf[6];  /* header (4) + length (2) */
+            memcpy(buf, shared_respb_array_hdr, 4);
+            uint16_t len_net = htons((uint16_t)length);
+            memcpy(buf + 4, &len_net, 2);
+            addReplyProto(c, buf, 6);
+        } else if (length < 0xFFFF) {
+            addRespbResponseHeader(c, RESPB_RESP_ARRAY);
             char lenbuf[2];
             uint16_t len_net = htons((uint16_t)length);
-            memcpy(lenbuf, &len_net, sizeof(len_net));
+            memcpy(lenbuf, &len_net, 2);
             addReplyProto(c, lenbuf, 2);
         } else {
+            addRespbResponseHeader(c, RESPB_RESP_ARRAY);
             char lenbuf[6];
             uint16_t marker = htons(0xFFFF);
             uint32_t len_net = htonl((uint32_t)length);
-            memcpy(lenbuf, &marker, sizeof(marker));
-            memcpy(lenbuf + 2, &len_net, sizeof(len_net));
+            memcpy(lenbuf, &marker, 2);
+            memcpy(lenbuf + 2, &len_net, 4);
             addReplyProto(c, lenbuf, 6);
         }
     } else {
@@ -969,18 +1129,26 @@ void addReplyRespbArrayLen(client *c, long length) {
 /* Start map reply in RESPB format */
 void addReplyRespbMapLen(client *c, long length) {
     if (c->resp == PROTO_RESPB) {
-        addRespbResponseHeader(c, RESPB_RESP_MAP);
-        if (length < 0xFFFF) {
+        if (c->respb_mux_id == 0 && length < 0xFFFF) {
+            /* Fast path: batch header + length into single call */
+            char buf[6];  /* header (4) + length (2) */
+            memcpy(buf, shared_respb_map_hdr, 4);
+            uint16_t len_net = htons((uint16_t)length);
+            memcpy(buf + 4, &len_net, 2);
+            addReplyProto(c, buf, 6);
+        } else if (length < 0xFFFF) {
+            addRespbResponseHeader(c, RESPB_RESP_MAP);
             char lenbuf[2];
             uint16_t len_net = htons((uint16_t)length);
-            memcpy(lenbuf, &len_net, sizeof(len_net));
+            memcpy(lenbuf, &len_net, 2);
             addReplyProto(c, lenbuf, 2);
         } else {
+            addRespbResponseHeader(c, RESPB_RESP_MAP);
             char lenbuf[6];
             uint16_t marker = htons(0xFFFF);
             uint32_t len_net = htonl((uint32_t)length);
-            memcpy(lenbuf, &marker, sizeof(marker));
-            memcpy(lenbuf + 2, &len_net, sizeof(len_net));
+            memcpy(lenbuf, &marker, 2);
+            memcpy(lenbuf + 2, &len_net, 4);
             addReplyProto(c, lenbuf, 6);
         }
     } else {
@@ -991,9 +1159,14 @@ void addReplyRespbMapLen(client *c, long length) {
 /* Reply with boolean in RESPB format */
 void addReplyRespbBool(client *c, int b) {
     if (c->resp == PROTO_RESPB) {
-        addRespbResponseHeader(c, RESPB_RESP_BOOL);
-        char val = b ? 1 : 0;
-        addReplyProto(c, &val, 1);
+        if (c->respb_mux_id == 0) {
+            /* Fast path: use pre-computed complete response */
+            addReplyProto(c, b ? shared_respb_true : shared_respb_false, 5);
+        } else {
+            addRespbResponseHeader(c, RESPB_RESP_BOOL);
+            char val = b ? 1 : 0;
+            addReplyProto(c, &val, 1);
+        }
     } else {
         addReplyBool(c, b);
     }
@@ -1002,21 +1175,22 @@ void addReplyRespbBool(client *c, int b) {
 /* Reply with double in RESPB format */
 void addReplyRespbDouble(client *c, double d) {
     if (c->resp == PROTO_RESPB) {
-        addRespbResponseHeader(c, RESPB_RESP_DOUBLE);
-        char buf[8];
         uint64_t val;
         /* Use memcpy for type punning to avoid strict aliasing violation */
         memcpy(&val, &d, sizeof(val));
-        /* Network byte order */
-        buf[0] = (val >> 56) & 0xFF;
-        buf[1] = (val >> 48) & 0xFF;
-        buf[2] = (val >> 40) & 0xFF;
-        buf[3] = (val >> 32) & 0xFF;
-        buf[4] = (val >> 24) & 0xFF;
-        buf[5] = (val >> 16) & 0xFF;
-        buf[6] = (val >> 8) & 0xFF;
-        buf[7] = val & 0xFF;
-        addReplyProto(c, buf, 8);
+
+        if (c->respb_mux_id == 0) {
+            /* Fast path: build complete response in single buffer */
+            char buf[12];  /* header (4) + double (8) */
+            memcpy(buf, shared_respb_double_hdr, 4);
+            encodeInt64BE(buf + 4, val);
+            addReplyProto(c, buf, 12);
+        } else {
+            addRespbResponseHeader(c, RESPB_RESP_DOUBLE);
+            char buf[8];
+            encodeInt64BE(buf, val);
+            addReplyProto(c, buf, 8);
+        }
     } else {
         addReplyDouble(c, d);
     }

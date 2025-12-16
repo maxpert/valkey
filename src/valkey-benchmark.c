@@ -484,6 +484,64 @@ static void replacePlaceholder(const size_t *indices, const size_t count, char *
 /* Forward declaration for RESPB placeholder replacement */
 static void replaceRespbPlaceholders(char *cmd_data, int cmd_count, size_t cmd_len);
 
+/* RESPB placeholder tracking (binary buffer aware) */
+static struct placeholders respb_placeholders;
+
+static void resetRespbPlaceholders(void) {
+    if (respb_placeholders.index_data) zfree(respb_placeholders.index_data);
+    memset(&respb_placeholders, 0, sizeof(respb_placeholders));
+}
+
+static void initRespbPlaceholders(const char *cmd, size_t cmd_len) {
+    resetRespbPlaceholders();
+    respb_placeholders.cmd_len = cmd_len;
+
+    /* store placeholder locations in temp arrays */
+    size_t total_count = 0;
+    size_t *temp_indices[PLACEHOLDER_COUNT];
+    for (size_t placeholder = 0; placeholder < PLACEHOLDER_COUNT; placeholder++) {
+        size_t *count = &respb_placeholders.count[placeholder];
+        *count = 0;
+
+        size_t temp_size = RANDPTR_INITIAL_SIZE;
+        temp_indices[placeholder] = zmalloc(sizeof(size_t) * temp_size);
+
+        /* Scan the binary buffer safely */
+        for (size_t i = 0; i + PLACEHOLDER_LEN <= cmd_len;) {
+            if (memcmp(cmd + i, PLACEHOLDERS[placeholder], PLACEHOLDER_LEN) == 0) {
+                if (*count == temp_size) {
+                    temp_size *= 2;
+                    temp_indices[placeholder] = zrealloc(temp_indices[placeholder], sizeof(size_t) * temp_size);
+                }
+                temp_indices[placeholder][*count] = i;
+                (*count)++;
+                total_count++;
+                i += PLACEHOLDER_LEN;
+            } else {
+                i++;
+            }
+        }
+    }
+
+    if (total_count == 0) {
+        for (size_t placeholder = 0; placeholder < PLACEHOLDER_COUNT; placeholder++) zfree(temp_indices[placeholder]);
+        return;
+    }
+
+    /* consolidate temp data into contiguous allocation */
+    respb_placeholders.index_data = zmalloc(sizeof(size_t) * total_count);
+    size_t overall_index = 0;
+    for (size_t placeholder = 0; placeholder < PLACEHOLDER_COUNT; placeholder++) {
+        respb_placeholders.indices[placeholder] = respb_placeholders.index_data + overall_index;
+
+        const size_t count = respb_placeholders.count[placeholder];
+        memcpy(respb_placeholders.indices[placeholder], temp_indices[placeholder], sizeof(size_t) * count);
+        overall_index += count;
+
+        zfree(temp_indices[placeholder]);
+    }
+}
+
 static void replacePlaceholders(char *cmd_data, int cmd_count) {
     static _Atomic uint64_t seq_key[PLACEHOLDER_COUNT] = {0};
 
@@ -1437,111 +1495,31 @@ static void benchmarkSequence(const char *title, char *cmd, int len, int seqlen)
     if (config.rps_histogram) hdr_close(config.rps_histogram);
 }
 
-/* =============================================================================
- * RESPB Command Template and Placeholder Support
- * ============================================================================= */
-
-/* RESPB command template - stores argument strings with placeholders */
-typedef struct respbCmdTemplate {
-    int argc;
-    char **argv;           /* Original argument strings (with placeholders) */
-    size_t *argvlen;       /* Length of each argument */
-    /* Placeholder info per argument */
-    struct {
-        int placeholder_type;   /* -1 = no placeholder, 0-9 = placeholder index */
-        size_t placeholder_offset; /* Offset within the argument string */
-    } *arg_placeholders;
-} respbCmdTemplate;
-
-/* Global RESPB command template */
-static respbCmdTemplate respb_template = {0};
-
-/* Free RESPB template */
-static void freeRespbTemplate(void) {
-    if (respb_template.argv) {
-        for (int i = 0; i < respb_template.argc; i++) {
-            if (respb_template.argv[i]) zfree(respb_template.argv[i]);
-        }
-        zfree(respb_template.argv);
-    }
-    if (respb_template.argvlen) zfree(respb_template.argvlen);
-    if (respb_template.arg_placeholders) zfree(respb_template.arg_placeholders);
-    memset(&respb_template, 0, sizeof(respb_template));
-}
-
-/* Generate a single RESPB command with placeholder replacement.
- * Returns allocated buffer (caller must zfree).
- */
-static char *generateRespbCommand(size_t *outlen, _Atomic uint64_t *seq_keys) {
-    if (respb_template.argc == 0) return NULL;
-
-    /* Create temporary argv with placeholders replaced */
-    char *temp_argv[32];
-    size_t temp_argvlen[32];
-
-    for (int i = 0; i < respb_template.argc && i < 32; i++) {
-        int ph = respb_template.arg_placeholders[i].placeholder_type;
-        if (ph >= 0 && config.replace_placeholders) {
-            /* This argument has a placeholder - make a copy and replace */
-            temp_argv[i] = zmalloc(respb_template.argvlen[i] + 1);
-            memcpy(temp_argv[i], respb_template.argv[i], respb_template.argvlen[i] + 1);
-            temp_argvlen[i] = respb_template.argvlen[i];
-
-            /* Generate random key */
-            uint64_t key = 0;
-            if (config.keyspacelen != 0) {
-                if (config.sequential_replacement) {
-                    key = atomic_fetch_add_explicit(&seq_keys[ph], 1, memory_order_relaxed);
-                } else {
-                    key = random();
-                }
-                key %= config.keyspacelen;
-            }
-
-            /* Replace placeholder with zero-padded number */
-            size_t offset = respb_template.arg_placeholders[i].placeholder_offset;
-            char *p = temp_argv[i] + offset + PLACEHOLDER_LEN - 1;
-            for (size_t j = 0; j < PLACEHOLDER_LEN; j++) {
-                *p = '0' + key % 10;
-                key /= 10;
-                p--;
-            }
-        } else {
-            /* No placeholder - use original */
-            temp_argv[i] = respb_template.argv[i];
-            temp_argvlen[i] = respb_template.argvlen[i];
-        }
-    }
-
-    /* Format as RESPB */
-    char *cmd = respbFormatCommand(outlen, respb_template.argc,
-                                   (const char **)temp_argv, temp_argvlen);
-
-    /* Free temporary copies */
-    for (int i = 0; i < respb_template.argc && i < 32; i++) {
-        if (respb_template.arg_placeholders[i].placeholder_type >= 0 &&
-            config.replace_placeholders) {
-            zfree(temp_argv[i]);
-        }
-    }
-
-    return cmd;
-}
-
-/* Replace placeholders in RESPB command buffer (multiple pipelined commands).
- * For RESPB, we need to regenerate commands since lengths change.
- * This replaces the buffer contents in-place (same size due to fixed placeholder len).
- */
+/* Replace placeholders in RESPB command buffer (multiple pipelined commands) using
+ * pre-scanned offsets. */
 static void replaceRespbPlaceholders(char *cmd_data, int cmd_count, size_t cmd_len) {
-    static _Atomic uint64_t seq_keys[PLACEHOLDER_COUNT] = {0};
+    static _Atomic uint64_t seq_key[PLACEHOLDER_COUNT] = {0};
 
-    for (int i = 0; i < cmd_count; i++) {
-        size_t new_len;
-        char *new_cmd = generateRespbCommand(&new_len, seq_keys);
-        if (new_cmd && new_len == cmd_len) {
-            memcpy(cmd_data + i * cmd_len, new_cmd, cmd_len);
+    if (respb_placeholders.cmd_len == 0 || respb_placeholders.cmd_len != cmd_len) return;
+
+    for (int cmd_index = 0; cmd_index < cmd_count; cmd_index++) {
+        char *cmd = cmd_data + cmd_index * cmd_len;
+
+        /* for __rand_int__, multiple instances will have different values */
+        size_t *indices = respb_placeholders.indices[0];
+        _Atomic uint64_t *key_counter = &seq_key[0];
+        for (size_t i = 0; i < respb_placeholders.count[0]; i++) {
+            replacePlaceholder(indices + i, 1, cmd, key_counter);
         }
-        if (new_cmd) zfree(new_cmd);
+
+        /* For other placeholders, multiple occurrences within the command will
+         * have the same value */
+        for (size_t placeholder = 1; placeholder < PLACEHOLDER_COUNT; placeholder++) {
+            size_t *ph_indices = respb_placeholders.indices[placeholder];
+            size_t count = respb_placeholders.count[placeholder];
+            _Atomic uint64_t *key_counter = &seq_key[placeholder];
+            replacePlaceholder(ph_indices, count, cmd, key_counter);
+        }
     }
 }
 
@@ -1609,52 +1587,8 @@ static char *formatRespbCommand(int *outlen, const char *format, ...) {
         zfree(arg_storage[i]);
     }
 
-    /* Also initialize the template for placeholder replacement */
-    freeRespbTemplate();
-    respb_template.argc = argc;
-    respb_template.argv = zcalloc(sizeof(char *) * argc);
-    respb_template.argvlen = zcalloc(sizeof(size_t) * argc);
-    respb_template.arg_placeholders = zcalloc(sizeof(*respb_template.arg_placeholders) * argc);
-
-    /* Re-parse to populate template (need to do this again since we freed resp_cmd) */
-    va_start(ap, format);
-    resp_len = valkeyvFormatCommand(&resp_cmd, format, ap);
-    va_end(ap);
-
-    if (resp_len > 0 && resp_cmd) {
-        p = resp_cmd + 1; /* skip * */
-        while (*p && *p != '\n') p++;
-        p++;
-
-        for (int i = 0; i < argc && i < 32; i++) {
-            if (*p != '$') break;
-            p++;
-            size_t len = atoi(p);
-            while (*p && *p != '\n') p++;
-            p++;
-
-            respb_template.argv[i] = zmalloc(len + 1);
-            memcpy(respb_template.argv[i], p, len);
-            respb_template.argv[i][len] = '\0';
-            respb_template.argvlen[i] = len;
-
-            /* Scan for placeholders */
-            respb_template.arg_placeholders[i].placeholder_type = -1;
-            for (int ph = 0; ph < PLACEHOLDER_COUNT; ph++) {
-                char *found = strstr(respb_template.argv[i], PLACEHOLDERS[ph]);
-                if (found) {
-                    respb_template.arg_placeholders[i].placeholder_type = ph;
-                    respb_template.arg_placeholders[i].placeholder_offset = found - respb_template.argv[i];
-                    break;
-                }
-            }
-
-            p += len;
-            if (*p == '\r') p++;
-            if (*p == '\n') p++;
-        }
-        free(resp_cmd);
-    }
+    /* Pre-compute placeholder offsets in the RESPB-encoded buffer for in-place replacement */
+    initRespbPlaceholders(cmd, len);
 
     return cmd;
 }

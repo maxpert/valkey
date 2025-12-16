@@ -105,8 +105,9 @@ typedef struct {
  * Encoded buffers contain headers followed by either plain replies or
  * by bulk string references */
 typedef enum {
-    PLAIN_REPLY = 0, /* plain reply */
-    BULK_STR_REF     /* bulk string references */
+    PLAIN_REPLY = 0,  /* plain reply */
+    BULK_STR_REF,     /* RESP bulk string references */
+    RESPB_BULK_REF    /* RESPB bulk string references */
 } payloadType;
 
 /* Encoded reply buffers consist from chunks
@@ -126,6 +127,14 @@ typedef struct __attribute__((__packed__)) bulkStrRef {
     robj *obj; /* pointer to object used for reference count management */
     sds str;   /* pointer to string to optimize memory access by I/O thread */
 } bulkStrRef;
+
+/* RESPB zero-copy bulk string reference - stores metadata for building RESPB header at I/O time */
+typedef struct __attribute__((__packed__)) respbBulkStrRef {
+    robj *obj;        /* pointer to object used for reference count management */
+    sds str;          /* pointer to string to optimize memory access by I/O thread */
+    uint16_t opcode;  /* RESPB response opcode (network byte order) */
+    uint16_t mux_id;  /* RESPB mux_id (network byte order) */
+} respbBulkStrRef;
 
 static void setProtocolError(const char *errstr, client *c);
 static void pauseClientsByClient(mstime_t end, int isPauseClientAll);
@@ -599,7 +608,7 @@ static void _addReplyPayloadToList(client *c, list *reply_list, const char *payl
     listNode *ln = listLast(reply_list);
     clientReplyBlock *tail = ln ? listNodeValue(ln) : NULL;
     /* Determine if encoded buffer is required */
-    int encoded = payload_type == BULK_STR_REF || isCopyAvoidPreferred(c, NULL);
+    int encoded = payload_type == BULK_STR_REF || payload_type == RESPB_BULK_REF || isCopyAvoidPreferred(c, NULL);
 
     /* Note that 'tail' may be NULL even if we have a tail node, because when
      * addReplyDeferredLen() is used, it sets a dummy node to NULL just
@@ -723,6 +732,49 @@ static void _addBulkStrRefToBufferOrList(client *c, robj *obj) {
     bulkStrRef str_ref = {.obj = obj, .str = obj->ptr};
     if (!_addBulkStrRefToBuffer(c, (void *)&str_ref, sizeof(str_ref))) {
         _addBulkStrRefToToList(c, (void *)&str_ref, sizeof(str_ref));
+    }
+}
+
+/* Adds RESPB bulk string reference to static buffer
+ * Returns non-zero value if succeeded to add */
+static size_t _addRespbBulkStrRefToBuffer(client *c, const void *payload, size_t len) {
+    if (!c->flag.buf_encoded) {
+        /* If buffer is plain and not empty then can't add bulk string reference to it */
+        if (c->bufpos) return 0;
+        c->flag.buf_encoded = 1;
+    }
+    return _addReplyPayloadToBuffer(c, payload, len, RESPB_BULK_REF);
+}
+
+/* Adds RESPB bulk string reference to reply list */
+static void _addRespbBulkStrRefToList(client *c, const void *payload, size_t len) {
+    _addReplyPayloadToList(c, c->reply, payload, len, RESPB_BULK_REF);
+}
+
+/* Zero-copy RESPB bulk string reply - stores pointer reference for I/O time processing.
+ * The opcode and mux_id should already be in network byte order. */
+void addReplyRespbBulkZeroCopy(client *c, robj *obj, uint16_t opcode_net, uint16_t mux_id_net) {
+    if (c->flag.close_after_reply) return;
+    if (prepareClientToWrite(c) != C_OK) return;
+
+    /* Only use zero-copy for RAW encoding (sds strings) */
+    if (obj->encoding != OBJ_ENCODING_RAW) {
+        /* Fall back to copy path for non-RAW encodings */
+        return;
+    }
+
+    /* Refcount will be decremented in write completion handler by the main thread */
+    incrRefCount(obj);
+
+    respbBulkStrRef str_ref = {
+        .obj = obj,
+        .str = obj->ptr,
+        .opcode = opcode_net,
+        .mux_id = mux_id_net
+    };
+
+    if (!_addRespbBulkStrRefToBuffer(c, (void *)&str_ref, sizeof(str_ref))) {
+        _addRespbBulkStrRefToList(c, (void *)&str_ref, sizeof(str_ref));
     }
 }
 
@@ -2598,6 +2650,47 @@ static void addBulkStringToReplyIOV(char *buf, size_t buf_len, replyIOV *reply, 
     }
 }
 
+/* Handle RESPB bulk string references - builds binary header at I/O time */
+static void addRespbBulkStringToReplyIOV(char *buf, size_t buf_len, replyIOV *reply, bufWriteMetadata *metadata) {
+    respbBulkStrRef *str_ref = (respbBulkStrRef *)buf;
+    while (buf_len > 0 && !reply->limit_reached) {
+        size_t str_len = sdslen(str_ref->str);
+
+        /* RESPB encodes bulk strings as: opcode(2) + mux_id(2) + len(2-6) + data
+         * Build the header in the prefix buffer */
+        char *prefix = reply->prefixes[reply->prfxcnt];
+        int prefix_len = 0;
+
+        /* Copy opcode and mux_id (already in network byte order) */
+        memcpy(prefix, &str_ref->opcode, 2);
+        memcpy(prefix + 2, &str_ref->mux_id, 2);
+        prefix_len = 4;
+
+        /* Add length prefix */
+        if (str_len < 0xFFFF) {
+            uint16_t len_net = htons((uint16_t)str_len);
+            memcpy(prefix + 4, &len_net, 2);
+            prefix_len = 6;
+        } else {
+            /* Large string: marker + 4-byte length */
+            uint16_t marker = htons(0xFFFF);
+            uint32_t len_net = htonl((uint32_t)str_len);
+            memcpy(prefix + 4, &marker, 2);
+            memcpy(prefix + 6, &len_net, 4);
+            prefix_len = 10;
+        }
+
+        int cnt = reply->iovcnt;
+        addPlainBufferToReplyIOV(reply->prefixes[reply->prfxcnt], prefix_len, reply, metadata);
+        /* Increment prfxcnt only if prefix was added to reply in this writevToClient invocation */
+        if (reply->iovcnt > cnt) reply->prfxcnt++;
+        addPlainBufferToReplyIOV(str_ref->str, str_len, reply, metadata);
+
+        str_ref++;
+        buf_len -= sizeof(respbBulkStrRef);
+    }
+}
+
 static void addEncodedBufferToReplyIOV(char *buf, size_t bufpos, replyIOV *reply, bufWriteMetadata *metadata) {
     char *ptr = buf;
     while (ptr < buf + bufpos && !reply->limit_reached) {
@@ -2605,9 +2698,14 @@ static void addEncodedBufferToReplyIOV(char *buf, size_t bufpos, replyIOV *reply
         ptr += sizeof(payloadHeader);
         if (header->payload_type == PLAIN_REPLY) {
             addPlainBufferToReplyIOV(ptr, header->payload_len, reply, metadata);
-        } else {
+        } else if (header->payload_type == BULK_STR_REF) {
             uint64_t data_len = metadata->data_len;
             addBulkStringToReplyIOV(ptr, header->payload_len, reply, metadata);
+            /* Store actual reply len for cluster slot stats */
+            header->reply_len = metadata->data_len - data_len;
+        } else if (header->payload_type == RESPB_BULK_REF) {
+            uint64_t data_len = metadata->data_len;
+            addRespbBulkStringToReplyIOV(ptr, header->payload_len, reply, metadata);
             /* Store actual reply len for cluster slot stats */
             header->reply_len = metadata->data_len - data_len;
         }
@@ -2855,6 +2953,16 @@ static void releaseBufReferences(char *buf, size_t bufpos) {
                 decrRefCount(str_ref->obj);
                 str_ref++;
                 len -= sizeof(bulkStrRef);
+            }
+        } else if (header->payload_type == RESPB_BULK_REF) {
+            clusterSlotStatsAddNetworkBytesOutForSlot(header->slot, header->reply_len);
+
+            respbBulkStrRef *str_ref = (respbBulkStrRef *)ptr;
+            size_t len = header->payload_len;
+            while (len > 0) {
+                decrRefCount(str_ref->obj);
+                str_ref++;
+                len -= sizeof(respbBulkStrRef);
             }
         } else {
             serverAssert(header->payload_type == PLAIN_REPLY);

@@ -2825,6 +2825,7 @@ void addReplyProto(client *c, const char *s, size_t len);
 void AddReplyFromClient(client *c, client *src);
 void commitDeferredReplyBuffer(client *c, int skip_if_blocked);
 void addReplyBulk(client *c, robj *obj);
+void addReplyRespbBulkZeroCopy(client *c, robj *obj, uint16_t opcode_net, uint16_t mux_id_net);
 void addReplyBulkCString(client *c, const char *s);
 void addReplyBulkCBuffer(client *c, const void *p, size_t len);
 void addWritePreparedReplyBulkCBuffer(writePreparedClient *c, const void *p, size_t len);
