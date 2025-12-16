@@ -523,8 +523,8 @@ void deleteCachedResponseClient(client *recording_client) {
 /* Updates an existing header, if possible; otherwise inserts a new one
  * Returns the length of data that can be added to the reply buffer (i.e. min(available, requested)) */
 static size_t upsertPayloadHeader(char *buf, size_t *bufpos, payloadHeader **last_header, uint8_t type, size_t len, int slot, size_t available) {
-    /* Enforce min len for BULK_STR_REF chunks as whole pointers must be written to the buffer */
-    size_t min_len = (type == BULK_STR_REF ? len : 1);
+    /* Enforce min len for BULK_STR_REF/RESPB_BULK_REF chunks as whole pointers must be written to the buffer */
+    size_t min_len = (type == BULK_STR_REF || type == RESPB_BULK_REF) ? len : 1;
     if (min_len > available) return 0;
     size_t allowed_len = min(available, len);
 

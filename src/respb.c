@@ -195,14 +195,14 @@ static void initOpcodeTable(void) {
 /* Find command name for opcode - O(1) direct lookup */
 const char *respbOpcodeToCommand(uint16_t opcode) {
     initOpcodeTable();
-    if (opcode >= RESPB_OPCODE_TABLE_SIZE) return NULL;
+    /* Table is sized for all uint16_t values, no bounds check needed */
     return opcodeTable[opcode].cmd_name;
 }
 
 /* Get fixed argc for opcode - O(1) direct lookup */
 int respbOpcodeFixedArgc(uint16_t opcode) {
     initOpcodeTable();
-    if (opcode >= RESPB_OPCODE_TABLE_SIZE) return 0;
+    /* Table is sized for all uint16_t values, no bounds check needed */
     return opcodeTable[opcode].fixed_argc;
 }
 
@@ -553,7 +553,7 @@ char *respbFormatCommand(size_t *len, int argc, const char **argv, const size_t 
     char *buf = NULL;
 
     /* Try command-specific encoder first */
-    if (opcode < RESPB_OPCODE_TABLE_SIZE && opcodeTable[opcode].encoder) {
+    if (opcodeTable[opcode].encoder) {
         buf = opcodeTable[opcode].encoder(len, argc, argv, argvlen);
     }
 

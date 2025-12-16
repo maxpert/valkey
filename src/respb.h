@@ -11,6 +11,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Forward declarations */
+struct client;
+
 /* RESPB Magic bytes for handshake */
 #define RESPB_MAGIC_BYTE1 0xD3
 #define RESPB_MAGIC_BYTE2 0xC1
@@ -303,26 +306,6 @@ typedef struct respbResponseHeader {
 
 /* Check if opcode is a response */
 #define IS_RESPB_RESPONSE_OPCODE(op) ((op) >= 0x8000 && (op) < 0xF000)
-
-/* Convert between host and network byte order for 16-bit */
-#ifdef __BIG_ENDIAN__
-#define RESPB_HTONS(x) (x)
-#define RESPB_NTOHS(x) (x)
-#else
-#define RESPB_HTONS(x) ((((x) & 0xFF) << 8) | (((x) >> 8) & 0xFF))
-#define RESPB_NTOHS(x) ((((x) & 0xFF) << 8) | (((x) >> 8) & 0xFF))
-#endif
-
-/* Convert between host and network byte order for 32-bit */
-#ifdef __BIG_ENDIAN__
-#define RESPB_HTONL(x) (x)
-#define RESPB_NTOHL(x) (x)
-#else
-#define RESPB_HTONL(x) (((x) << 24) | (((x) & 0xFF00) << 8) | \
-                        (((x) >> 8) & 0xFF00) | ((x) >> 24))
-#define RESPB_NTOHL(x) (((x) << 24) | (((x) & 0xFF00) << 8) | \
-                        (((x) >> 8) & 0xFF00) | ((x) >> 24))
-#endif
 
 /* =============================================================================
  * RESPB Protocol Constants

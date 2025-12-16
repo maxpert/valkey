@@ -133,13 +133,13 @@ void respbInitServer(void) {
 
 /* Get cached command for opcode - O(1), no string lookup */
 struct serverCommand *respbOpcodeCommand(uint16_t opcode) {
-    if (opcode >= RESPB_OPCODE_TABLE_SIZE) return NULL;
+    /* Table is sized for all uint16_t values, no bounds check needed */
     return serverOpcodeTable[opcode].cmd;
 }
 
 /* Get shared command name robj for opcode - O(1), no allocation */
 robj *respbOpcodeSharedName(uint16_t opcode) {
-    if (opcode >= RESPB_OPCODE_TABLE_SIZE) return NULL;
+    /* Table is sized for all uint16_t values, no bounds check needed */
     return serverOpcodeTable[opcode].shared_name;
 }
 
@@ -188,10 +188,7 @@ static int respbDecodeKeyOnly(client *c, const char *buf, size_t buflen, size_t 
     uint16_t keylen;
     if (respbReadLen16(buf, buflen, pos, &keylen) == C_ERR) return 0;
 
-    /* Validate keylen to prevent huge allocations */
-    if (keylen > 512 * 1024 * 1024) {  /* 512MB max key size */
-        return READ_FLAGS_ERROR_BIG_INLINE_REQUEST;
-    }
+    /* keylen is uint16_t (max 65535), no need to validate against large limits */
 
     if (buflen - *pos < keylen) return 0;
 
@@ -234,10 +231,7 @@ static int respbDecodeSet(client *c, const char *buf, size_t buflen, size_t *pos
     uint16_t keylen;
     if (respbReadLen16(buf, buflen, pos, &keylen) == C_ERR) return 0;
 
-    /* Validate keylen */
-    if (keylen > 512 * 1024 * 1024) {  /* 512MB max */
-        return READ_FLAGS_ERROR_BIG_INLINE_REQUEST;
-    }
+    /* keylen is uint16_t (max 65535), no need to validate against large limits */
 
     if (buflen - *pos < keylen) return 0;
     size_t key_pos = *pos;
@@ -553,6 +547,7 @@ static int respbDecodeKeyPairs(client *c, const char *buf, size_t buflen, size_t
  */
 static int respbDecodeGeneric(client *c, const char *buf, size_t buflen, size_t *pos,
                                int fixed_argc, uint16_t opcode, respbParseContext *ctx) {
+    (void)c;  /* Unused but kept for consistent decoder signature */
     int argc;
     if (fixed_argc > 0) {
         argc = fixed_argc;
@@ -722,13 +717,10 @@ int parseRespbBuffer(client *c) {
     uint8_t enc_type = RESPB_ENC_GENERIC;
 
     /* Get encoding type from opcode table */
-    if (opcode < RESPB_OPCODE_TABLE_SIZE) {
-        const char *check_cmd = respbOpcodeToCommand(opcode);
-        if (check_cmd) {
-            /* Access the client-side opcode table to get enc_type */
-            /* We need to call a function that exposes this from respb.c */
-            /* For now, dispatch based on opcode directly */
-            switch (opcode) {
+    const char *check_cmd = respbOpcodeToCommand(opcode);
+    if (check_cmd) {
+        /* Dispatch based on opcode directly */
+        switch (opcode) {
             case RESPB_OP_GET:
             case RESPB_OP_INCR:
                 enc_type = RESPB_ENC_KEY_ONLY;
@@ -750,7 +742,6 @@ int parseRespbBuffer(client *c) {
             default:
                 enc_type = RESPB_ENC_GENERIC;
                 break;
-            }
         }
     }
 
