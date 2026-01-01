@@ -8,6 +8,15 @@
 #include "server.h"
 #include "respb.h"
 #include <arpa/inet.h>
+#include <stdatomic.h>
+
+static _Atomic long long respb_fast_hits = 0;
+static _Atomic long long respb_fast_misses = 0;
+static _Atomic long long respb_resume_phase_4 = 0;
+static _Atomic long long respb_total_miss_avail = 0;
+
+/* External declaration for thread-local shared query buffer (defined in networking.c) */
+extern _Thread_local sds thread_shared_qb;
 
 /* =============================================================================
  * Server-side Opcode Table Extensions
@@ -21,6 +30,7 @@ typedef struct respbServerOpcodeInfo {
 
 static respbServerOpcodeInfo serverOpcodeTable[RESPB_OPCODE_TABLE_SIZE];
 static int serverOpcodeTableInitialized = 0;
+
 
 /* =============================================================================
  * Pre-allocated Shared RESPB Response Buffers
@@ -222,10 +232,216 @@ static int respbDecodeKeyOnly(client *c, const char *buf, size_t buflen, size_t 
     return READ_FLAGS_PARSING_COMPLETED;
 }
 
-/* Decoder for KEY_VALUE pattern: SET
- * Format: [keylen:2B][key][vallen:4B][value][flags:1B]
- * Basic: ignores flags, produces argv: [SET, key, value]
+/* Decoder for KEY_ONLY pattern: GET, INCR - RESUMABLE
+ * Format: [keylen:2B][key]
+ * Phases: 1=keylen, 2=key
  */
+static int respbDecodeKeyOnlyResumable(client *c) {
+    const char *buf = c->querybuf;
+    size_t buflen = sdslen(c->querybuf);
+
+    /* Phase 1: Read keylen (2 bytes) */
+    if (c->respb_phase == 1) {
+        if (buflen - c->qb_pos < 2) return 0;
+        uint16_t keylen;
+        memcpy(&keylen, buf + c->qb_pos, 2);
+        c->respb_bulklen = ntohs(keylen);
+        c->qb_pos += 2;  /* COMMIT */
+        c->net_input_bytes_curr_cmd += 2;  /* Accumulate keylen prefix */
+        c->respb_phase = 2;
+    }
+
+    /* Phase 2: Read key data */
+    if (c->respb_phase == 2) {
+        if (buflen - c->qb_pos < c->respb_bulklen) return 0;
+
+        /* Allocate argv */
+        if (c->argv == NULL) {
+            c->argv = zmalloc(sizeof(robj *) * 2);
+            c->argv_len = 2;
+            c->argc = 0;
+            c->argv_len_sum = 0;
+
+            /* Add command name (shared object) */
+            robj *shared = respbOpcodeSharedName(c->respb_opcode);
+            if (shared) {
+                incrRefCount(shared);
+                c->argv[c->argc++] = shared;
+                c->argv_len_sum += sdslen(shared->ptr);
+            } else {
+                const char *cmd_name = respbOpcodeToCommand(c->respb_opcode);
+                c->argv[c->argc++] = createStringObject(cmd_name, strlen(cmd_name));
+                c->argv_len_sum += strlen(cmd_name);
+            }
+        }
+
+        /* Create key object */
+        c->argv[c->argc++] = createStringObject(buf + c->qb_pos, c->respb_bulklen);
+        c->argv_len_sum += c->respb_bulklen;
+        c->qb_pos += c->respb_bulklen;  /* COMMIT */
+    }
+
+    return READ_FLAGS_PARSING_COMPLETED;
+}
+
+/* Decoder for KEY_VALUE pattern: SET - RESUMABLE with ZERO-COPY
+ * Format: [keylen:2B][key][vallen:4B][value][flags:1B]
+ * Phases: 1=keylen, 2=key, 3=vallen, 4=value, 5=flags
+ * Produces argv: [SET, key, value]
+ *
+ * This resumable version:
+ * - Uses c->qb_pos directly (commits after each field)
+ * - Uses c->respb_phase to track progress
+ * - Uses c->respb_bulklen to save current field length
+ * - Creates objects IMMEDIATELY when data available
+ * - Returns 0 on incomplete WITHOUT destroying partial argv
+ *
+ * Zero-copy optimization (matching RESP3's behavior for large values >= 32KB):
+ * 1. When waiting for a large value, prepare buffer by shifting data to start
+ *    and pre-allocating exact space needed (value + flags byte)
+ * 2. When buffer contains exactly the value data, transfer querybuf ownership
+ *    directly to the robj instead of copying, then allocate a new querybuf
+ * This avoids copying large values twice (network -> querybuf -> robj)
+ */
+static int respbDecodeSetResumable(client *c) {
+    const char *buf = c->querybuf;
+    size_t buflen = sdslen(c->querybuf);
+
+    /* Phase 1: Read keylen (2 bytes) */
+    if (c->respb_phase == 1) {
+        if (buflen - c->qb_pos < 2) return 0;
+        uint16_t keylen;
+        memcpy(&keylen, buf + c->qb_pos, 2);
+        c->respb_bulklen = ntohs(keylen);
+        c->qb_pos += 2;  /* COMMIT */
+        c->net_input_bytes_curr_cmd += 2;  /* Accumulate keylen prefix */
+        c->respb_phase = 2;
+    }
+
+    /* Phase 2: Read key data */
+    if (c->respb_phase == 2) {
+        if (buflen - c->qb_pos < c->respb_bulklen) return 0;
+
+        /* Allocate argv on first data field */
+        if (c->argv == NULL) {
+            c->argv = zmalloc(sizeof(robj *) * 3);
+            c->argv_len = 3;
+            c->argc = 0;
+            c->argv_len_sum = 0;
+
+            /* Add command name (shared object) */
+            robj *shared = respbOpcodeSharedName(c->respb_opcode);
+            if (shared) {
+                incrRefCount(shared);
+                c->argv[c->argc++] = shared;
+                c->argv_len_sum += sdslen(shared->ptr);
+            } else {
+                c->argv[c->argc++] = createStringObject("SET", 3);
+                c->argv_len_sum += 3;
+            }
+        }
+
+        /* Create key object IMMEDIATELY */
+        c->argv[c->argc++] = createStringObject(buf + c->qb_pos, c->respb_bulklen);
+        c->argv_len_sum += c->respb_bulklen;
+        c->qb_pos += c->respb_bulklen;  /* COMMIT */
+        c->respb_phase = 3;
+    }
+
+    /* Phase 3: Read vallen (4 bytes) */
+    if (c->respb_phase == 3) {
+        if (buflen - c->qb_pos < 4) return 0;
+        uint32_t vallen;
+        memcpy(&vallen, buf + c->qb_pos, 4);
+        c->respb_bulklen = ntohl(vallen);
+
+        /* Validate vallen */
+        if (c->respb_bulklen > 512 * 1024 * 1024) {
+            return READ_FLAGS_ERROR_BIG_INLINE_REQUEST;
+        }
+
+        c->qb_pos += 4;  /* COMMIT */
+        c->net_input_bytes_curr_cmd += 4;  /* Accumulate vallen prefix */
+        c->respb_phase = 4;
+    }
+
+    /* Phase 4: Read value data (with zero-copy optimization for large values) */
+    if (c->respb_phase == 4) {
+        atomic_fetch_add_explicit(&respb_resume_phase_4, 1, memory_order_relaxed);
+        if (buflen - c->qb_pos < c->respb_bulklen) {
+            /* Not enough data yet - prepare for zero-copy if value is large (>= 32KB) */
+            if (c->respb_bulklen >= PROTO_MBULK_BIG_ARG) {
+                /* Check if we should prepare buffer for zero-copy:
+                 * Only when remaining data in buffer is <= value size + 1 (flags byte) */
+                if (sdslen(c->querybuf) - c->qb_pos <= c->respb_bulklen + 1) {
+                    /* Take ownership of shared buffer if using it */
+                    if (c->querybuf == thread_shared_qb) {
+                        initSharedQueryBuf();
+                    }
+                    /* Shift data to buffer start for zero-copy alignment */
+                    sdsrange(c->querybuf, c->qb_pos, -1);
+                    c->qb_pos = 0;
+                    /* Pre-allocate exact space needed for value + flags */
+                    c->querybuf = sdsMakeRoomForNonGreedy(c->querybuf,
+                        c->respb_bulklen + 1 - sdslen(c->querybuf));
+                    /* Update peak to prevent premature shrinking */
+                    if (c->querybuf_peak < c->respb_bulklen + 1) {
+                        c->querybuf_peak = c->respb_bulklen + 1;
+                    }
+                }
+            }
+            return 0;  /* Need more data */
+        }
+
+        /* We have enough data - check for zero-copy path */
+        if (c->respb_bulklen >= PROTO_MBULK_BIG_ARG &&
+            c->qb_pos == 0 &&
+            c->querybuf != thread_shared_qb &&
+            sdslen(c->querybuf) == c->respb_bulklen + 1) {
+            /* Zero-copy path: buffer contains exactly our value + flags byte
+             * Transfer querybuf ownership directly to robj to avoid copying */
+
+            /* Save the flags byte before we trim the buffer */
+            /* uint8_t flags = c->querybuf[c->respb_bulklen]; */  /* For future use */
+
+            /* Trim the sds to just the value (remove flags byte from sds length) */
+            sdsIncrLen(c->querybuf, -(sdslen(c->querybuf) - c->respb_bulklen));
+
+            /* Create object with direct buffer ownership - no copy! */
+            c->argv[c->argc++] = createObject(OBJ_STRING, c->querybuf);
+            c->argv_len_sum += c->respb_bulklen;
+
+            /* Allocate new querybuf for future reads (assume more large values likely) */
+            c->querybuf = sdsnewlen(SDS_NOINIT, c->respb_bulklen + 1);
+            sdsclear(c->querybuf);
+            c->qb_pos = 0;
+
+            /* Accumulate flags byte for zero-copy path */
+            c->net_input_bytes_curr_cmd += 1;
+
+            /* We've consumed the value AND the flags byte, so return completion */
+            return READ_FLAGS_PARSING_COMPLETED;
+        }
+
+        /* Normal copy path */
+        c->argv[c->argc++] = createStringObject(buf + c->qb_pos, c->respb_bulklen);
+        c->argv_len_sum += c->respb_bulklen;
+        c->qb_pos += c->respb_bulklen;  /* COMMIT */
+        c->respb_phase = 5;
+    }
+
+    /* Phase 5: Read flags (1 byte) */
+    if (c->respb_phase == 5) {
+        if (buflen - c->qb_pos < 1) return 0;
+        /* uint8_t flags = buf[c->qb_pos]; */  /* Use if needed */
+        c->qb_pos += 1;  /* COMMIT */
+        c->net_input_bytes_curr_cmd += 1;  /* Accumulate flags byte */
+    }
+
+    return READ_FLAGS_PARSING_COMPLETED;
+}
+
+/* Old non-resumable decoder kept for pipelined command parsing */
 static int respbDecodeSet(client *c, const char *buf, size_t buflen, size_t *pos,
                           respbParseContext *ctx) {
     uint16_t keylen;
@@ -286,10 +502,114 @@ static int respbDecodeSet(client *c, const char *buf, size_t buflen, size_t *pos
     return READ_FLAGS_PARSING_COMPLETED;
 }
 
-/* Decoder for KEY_ELEMENTS pattern: LPUSH, RPUSH
+/* Decoder for KEY_ELEMENTS pattern: LPUSH, RPUSH - RESUMABLE
  * Format: [keylen:2B][key][count:2B]([elemlen:2B][elem])...
+ * Phases: 1=keylen, 2=key, 3=count, 4=elemlen, 5=elem (loop on 4-5)
  * Produces argv: [command, key, elem1, elem2, ...]
+ *
+ * This resumable version:
+ * - Uses c->qb_pos directly (commits after each field)
+ * - Uses c->respb_phase to track progress
+ * - Uses c->respb_bulklen to save current field length
+ * - Uses c->respb_remaining to track elements left to parse
+ * - Creates objects IMMEDIATELY when data available
+ * - Returns 0 on incomplete WITHOUT destroying partial argv
  */
+static int respbDecodeKeyElementsResumable(client *c) {
+    const char *buf = c->querybuf;
+    size_t buflen = sdslen(c->querybuf);
+
+    /* Phase 1: Read keylen (2 bytes) */
+    if (c->respb_phase == 1) {
+        if (buflen - c->qb_pos < 2) return 0;
+        uint16_t keylen;
+        memcpy(&keylen, buf + c->qb_pos, 2);
+        c->respb_bulklen = ntohs(keylen);
+        c->qb_pos += 2;  /* COMMIT */
+        c->net_input_bytes_curr_cmd += 2;  /* Accumulate keylen prefix */
+        c->respb_phase = 2;
+    }
+
+    /* Phase 2: Read key data - create command and key objects immediately */
+    if (c->respb_phase == 2) {
+        if (buflen - c->qb_pos < c->respb_bulklen) return 0;
+
+        /* Allocate initial argv with just command + key (will resize in phase 3) */
+        if (c->argv == NULL) {
+            c->argv = zmalloc(sizeof(robj *) * 2);
+            c->argv_len = 2;
+            c->argc = 0;
+            c->argv_len_sum = 0;
+
+            /* Add command name (shared object) */
+            robj *shared = respbOpcodeSharedName(c->respb_opcode);
+            if (shared) {
+                incrRefCount(shared);
+                c->argv[c->argc++] = shared;
+                c->argv_len_sum += sdslen(shared->ptr);
+            } else {
+                const char *cmd_name = respbOpcodeToCommand(c->respb_opcode);
+                c->argv[c->argc++] = createStringObject(cmd_name, strlen(cmd_name));
+                c->argv_len_sum += strlen(cmd_name);
+            }
+        }
+
+        /* Create key object IMMEDIATELY */
+        c->argv[c->argc++] = createStringObject(buf + c->qb_pos, c->respb_bulklen);
+        c->argv_len_sum += c->respb_bulklen;
+        c->qb_pos += c->respb_bulklen;  /* COMMIT */
+        c->respb_phase = 3;
+    }
+
+    /* Phase 3: Read count (2 bytes) and resize argv */
+    if (c->respb_phase == 3) {
+        if (buflen - c->qb_pos < 2) return 0;
+        uint16_t count;
+        memcpy(&count, buf + c->qb_pos, 2);
+        c->respb_remaining = ntohs(count);
+        c->qb_pos += 2;  /* COMMIT */
+        c->net_input_bytes_curr_cmd += 2;  /* Accumulate count prefix */
+
+        /* Validate count to prevent huge allocations */
+        if (c->respb_remaining > 10000) {
+            return READ_FLAGS_ERROR_BIG_INLINE_REQUEST;
+        }
+
+        /* Resize argv to fit all elements: command + key + elements */
+        c->argv = zrealloc(c->argv, sizeof(robj *) * (2 + c->respb_remaining));
+        c->argv_len = 2 + c->respb_remaining;
+        c->respb_phase = 4;
+    }
+
+    /* Phase 4-5: Loop for each element */
+    while (c->respb_remaining > 0) {
+        /* Phase 4: Read elemlen (2 bytes) */
+        if (c->respb_phase == 4) {
+            if (buflen - c->qb_pos < 2) return 0;
+            uint16_t elemlen;
+            memcpy(&elemlen, buf + c->qb_pos, 2);
+            c->respb_bulklen = ntohs(elemlen);
+            c->qb_pos += 2;  /* COMMIT */
+            c->net_input_bytes_curr_cmd += 2;  /* Accumulate elemlen prefix */
+            c->respb_phase = 5;
+        }
+
+        /* Phase 5: Read elem data */
+        if (c->respb_phase == 5) {
+            if (buflen - c->qb_pos < c->respb_bulklen) return 0;
+
+            c->argv[c->argc++] = createStringObject(buf + c->qb_pos, c->respb_bulklen);
+            c->argv_len_sum += c->respb_bulklen;
+            c->qb_pos += c->respb_bulklen;  /* COMMIT */
+            c->respb_remaining--;
+            c->respb_phase = 4;  /* Back to elemlen for next element */
+        }
+    }
+
+    return READ_FLAGS_PARSING_COMPLETED;
+}
+
+/* Old non-resumable decoder kept for pipelined command parsing */
 static int respbDecodeKeyElements(client *c, const char *buf, size_t buflen, size_t *pos,
                                    respbParseContext *ctx) {
     uint16_t keylen;
@@ -663,56 +983,170 @@ static int respbDecodeGeneric(client *c, const char *buf, size_t buflen, size_t 
  *  - READ_FLAGS_PARSING_COMPLETED on success
  *  - 0 if more data needed
  *  - READ_FLAGS_ERROR_* on error
+ *
+ * This function supports resumable parsing via c->respb_phase:
+ *  - Phase 0: Parse header (opcode, mux_id)
+ *  - Phase 1+: Decoder-specific field parsing
  */
 int parseRespbBuffer(client *c) {
-    size_t qblen = sdslen(c->querybuf);
-    size_t pos = c->qb_pos;
     const char *buf = c->querybuf;
+    size_t buflen = sdslen(c->querybuf);
 
-    /* Need at least header size */
-    if (qblen - pos < RESPB_HEADER_SIZE) return 0;
+    /* Handle protocol switching from RESP3 */
+    if (c->multibulklen != 0) {
+        c->multibulklen = 0;
+        c->bulklen = -1;
+        freeClientArgv(c);
+    }
 
-    /* Read header (using memcpy for safe unaligned access) */
-    uint16_t opcode_raw, mux_id_raw;
-    memcpy(&opcode_raw, buf + pos, sizeof(opcode_raw));
-    memcpy(&mux_id_raw, buf + pos + 2, sizeof(mux_id_raw));
-    uint16_t opcode = ntohs(opcode_raw);
-    uint16_t mux_id = ntohs(mux_id_raw);
-    pos += RESPB_HEADER_SIZE;
+    /* Phase 0: Parse header */
+    if (c->respb_phase == 0) {
+        if (buflen - c->qb_pos < RESPB_HEADER_SIZE) return 0;
 
-    /* Store mux_id and opcode for response */
-    c->respb_mux_id = mux_id;
-    c->respb_opcode = opcode;
+        /* Read header (using memcpy for safe unaligned access) */
+        uint16_t opcode_raw, mux_id_raw;
+        memcpy(&opcode_raw, buf + c->qb_pos, sizeof(opcode_raw));
+        memcpy(&mux_id_raw, buf + c->qb_pos + 2, sizeof(mux_id_raw));
+        c->respb_opcode = ntohs(opcode_raw);
+        c->respb_mux_id = ntohs(mux_id_raw);
 
-    /* CRITICAL: Set response protocol to RESPB so reply functions use binary format */
-    c->resp = PROTO_RESPB;
+        /* FAST-PATH: Check if full command is available in buffer.
+         * When entire command fits in buffer, use atomic decoder to bypass
+         * the phase-based state machine overhead. */
+        size_t avail = buflen - c->qb_pos - RESPB_HEADER_SIZE;
+        size_t pos = c->qb_pos + RESPB_HEADER_SIZE;
+        int fast_path_result = 0;
+
+        if (c->respb_opcode == RESPB_OP_SET) {
+            /* SET format: [keylen:2B][key][vallen:4B][value][flags:1B]
+             * Minimum to peek: 2 bytes for keylen */
+            if (avail >= 2) {
+                uint16_t keylen_raw;
+                memcpy(&keylen_raw, buf + pos, 2);
+                uint16_t keylen = ntohs(keylen_raw);
+                /* Need: keylen(2) + key + vallen(4) */
+                if (avail >= (size_t)(2 + keylen + 4)) {
+                    uint32_t vallen_raw;
+                    memcpy(&vallen_raw, buf + pos + 2 + keylen, 4);
+                    uint32_t vallen = ntohl(vallen_raw);
+                    /* Total needed: keylen(2) + key + vallen(4) + value + flags(1) */
+                    size_t total_needed = 2 + keylen + 4 + vallen + 1;
+                    if (avail >= total_needed) {
+                        /* Full command available - use atomic decoder */
+                        c->qb_pos += RESPB_HEADER_SIZE;
+                        c->resp = PROTO_RESPB;
+                        respbParseContext ctx = {
+                            .argc = &c->argc,
+                            .argv = &c->argv,
+                            .argv_len = &c->argv_len,
+                            .argv_len_sum = &c->argv_len_sum
+                        };
+                        fast_path_result = respbDecodeSet(c, buf, buflen, &c->qb_pos, &ctx);
+                        if (fast_path_result == READ_FLAGS_PARSING_COMPLETED) {
+                            /* Success - finalize command */
+                            long long hits = atomic_fetch_add_explicit(&respb_fast_hits, 1, memory_order_relaxed);
+                            if (hits % 100000 == 0) {
+                                long long misses = atomic_load_explicit(&respb_fast_misses, memory_order_relaxed);
+                                long long phase4 = atomic_load_explicit(&respb_resume_phase_4, memory_order_relaxed);
+                                long long tot_avail = atomic_load_explicit(&respb_total_miss_avail, memory_order_relaxed);
+                                double avg_avail = misses ? (double)tot_avail / misses : 0;
+                                serverLog(LL_WARNING, "RESPB Stats: Hits=%lld Misses=%lld (AvgAvail=%.1f) Phase4Resumes=%lld",
+                                    hits, misses, avg_avail, phase4);
+                            }
+                            c->parsed_cmd = respbOpcodeCommand(c->respb_opcode);
+                            c->net_input_bytes_curr_cmd = total_needed + RESPB_HEADER_SIZE;
+                            c->read_flags |= READ_FLAGS_PARSING_COMPLETED;
+                            c->respb_phase = 0;
+                            c->reqtype = 0;
+                            goto fast_path_pipelining;
+                        } else if (fast_path_result != 0) {
+                            /* Error from decoder */
+                            c->respb_phase = 0;
+                            return fast_path_result;
+                        }
+                        /* fast_path_result == 0 means need more data, fall through */
+                    } else {
+                        /* Missed Fast Path */
+                        atomic_fetch_add_explicit(&respb_fast_misses, 1, memory_order_relaxed);
+                        atomic_fetch_add_explicit(&respb_total_miss_avail, avail, memory_order_relaxed);
+                    }
+                }
+            }
+        } else if (c->respb_opcode == RESPB_OP_GET || c->respb_opcode == RESPB_OP_INCR) {
+            /* KEY_ONLY format: [keylen:2B][key]
+             * Minimum to peek: 2 bytes for keylen */
+            if (avail >= 2) {
+                uint16_t keylen_raw;
+                memcpy(&keylen_raw, buf + pos, 2);
+                uint16_t keylen = ntohs(keylen_raw);
+                /* Total needed: keylen(2) + key */
+                size_t total_needed = 2 + keylen;
+                if (avail >= total_needed) {
+                    /* Full command available - use atomic decoder */
+                    c->qb_pos += RESPB_HEADER_SIZE;
+                    c->resp = PROTO_RESPB;
+                    respbParseContext ctx = {
+                        .argc = &c->argc,
+                        .argv = &c->argv,
+                        .argv_len = &c->argv_len,
+                        .argv_len_sum = &c->argv_len_sum
+                    };
+                    fast_path_result = respbDecodeKeyOnly(c, buf, buflen, &c->qb_pos, &ctx);
+                    if (fast_path_result == READ_FLAGS_PARSING_COMPLETED) {
+                        /* Success - finalize command */
+                        c->parsed_cmd = respbOpcodeCommand(c->respb_opcode);
+                        c->net_input_bytes_curr_cmd = total_needed + RESPB_HEADER_SIZE;
+                        c->read_flags |= READ_FLAGS_PARSING_COMPLETED;
+                        c->respb_phase = 0;
+                        c->reqtype = 0;
+                        goto fast_path_pipelining;
+                    } else if (fast_path_result != 0) {
+                        /* Error from decoder */
+                        c->respb_phase = 0;
+                        return fast_path_result;
+                    }
+                    /* fast_path_result == 0 means need more data, fall through */
+                }
+            }
+        }
+
+        /* No fast-path taken - proceed with resumable parsing */
+        c->qb_pos += RESPB_HEADER_SIZE;  /* COMMIT immediately! */
+        c->net_input_bytes_curr_cmd += RESPB_HEADER_SIZE;  /* Accumulate header bytes */
+        c->resp = PROTO_RESPB;
+        c->respb_phase = 1;  /* Ready for decoder */
+        c->respb_bulklen = 0;  /* Reset for first field */
+    }
+
+    /* Use stored opcode for dispatching */
+    uint16_t opcode = c->respb_opcode;
 
     /* Handle RESP passthrough */
     if (IS_RESPB_PASSTHROUGH_OPCODE(opcode)) {
-        if (qblen - pos < 4) return 0;  /* Need RESP length */
+        if (buflen - c->qb_pos < 4) return 0;  /* Need RESP length */
         uint32_t resp_len_raw;
-        memcpy(&resp_len_raw, buf + pos, sizeof(resp_len_raw));
+        memcpy(&resp_len_raw, buf + c->qb_pos, sizeof(resp_len_raw));
         uint32_t resp_len = ntohl(resp_len_raw);
-        pos += 4;
 
-        if (qblen - pos < resp_len) return 0;  /* Need full RESP data */
+        if (buflen - c->qb_pos - 4 < resp_len) return 0;  /* Need full RESP data */
 
         /* Parse the embedded RESP data using standard parser */
         /* For now, we'll handle passthrough by setting reqtype back to RESP */
-        c->qb_pos = pos;
+        c->qb_pos += 4;
         c->reqtype = PROTO_REQ_MULTIBULK;
+        c->respb_phase = 0;  /* Reset phase */
         return 0;  /* Let standard parser handle it */
     }
 
     /* Lookup command */
     const char *cmd_name = respbOpcodeToCommand(opcode);
     if (!cmd_name) {
+        c->respb_phase = 0;  /* Reset phase on error */
         c->read_flags |= READ_FLAGS_ERROR_BIG_INLINE_REQUEST;  /* Reuse error flag */
         return READ_FLAGS_ERROR_BIG_INLINE_REQUEST;
     }
 
     /* Dispatch to decoder based on encoding type */
-    size_t start_pos = pos;
     int result = 0;
     uint8_t enc_type = RESPB_ENC_GENERIC;
 
@@ -753,27 +1187,35 @@ int parseRespbBuffer(client *c) {
         .argv_len_sum = &c->argv_len_sum
     };
 
-    /* Dispatch to appropriate decoder */
+    /* Dispatch to appropriate decoder
+     * Note: KEY_ONLY, KEY_VALUE, and KEY_ELEMENTS use resumable decoders that read from c->qb_pos directly.
+     * Other decoders still use the old pos-based approach and need ctx. */
+    size_t pos = c->qb_pos;  /* For non-resumable decoders */
     switch (enc_type) {
     case RESPB_ENC_KEY_ONLY:
-        result = respbDecodeKeyOnly(c, buf, qblen, &pos, &ctx);
+        result = respbDecodeKeyOnlyResumable(c);
         break;
     case RESPB_ENC_KEY_VALUE:
-        result = respbDecodeSet(c, buf, qblen, &pos, &ctx);
+        /* Use the new resumable decoder - reads/writes c->qb_pos directly */
+        result = respbDecodeSetResumable(c);
         break;
     case RESPB_ENC_KEY_ELEMENTS:
-        result = respbDecodeKeyElements(c, buf, qblen, &pos, &ctx);
+        /* Use the new resumable decoder - reads/writes c->qb_pos directly */
+        result = respbDecodeKeyElementsResumable(c);
         break;
     case RESPB_ENC_KEY_OPTCOUNT:
-        result = respbDecodeKeyOptCount(c, buf, qblen, &pos, &ctx);
+        result = respbDecodeKeyOptCount(c, buf, buflen, &pos, &ctx);
+        c->qb_pos = pos;  /* Update client position */
         break;
     case RESPB_ENC_KEY_PAIRS:
-        result = respbDecodeKeyPairs(c, buf, qblen, &pos, &ctx);
+        result = respbDecodeKeyPairs(c, buf, buflen, &pos, &ctx);
+        c->qb_pos = pos;  /* Update client position */
         break;
     case RESPB_ENC_GENERIC:
     default: {
         int fixed_argc = respbOpcodeFixedArgc(opcode);
-        result = respbDecodeGeneric(c, buf, qblen, &pos, fixed_argc, opcode, &ctx);
+        result = respbDecodeGeneric(c, buf, buflen, &pos, fixed_argc, opcode, &ctx);
+        c->qb_pos = pos;  /* Update client position */
         break;
     }
     }
@@ -785,13 +1227,15 @@ int parseRespbBuffer(client *c) {
     /* Set command directly - bypass string lookup in prepareCommand */
     c->parsed_cmd = respbOpcodeCommand(opcode);
 
-    /* Update query buffer position */
-    c->qb_pos = pos;
-    c->net_input_bytes_curr_cmd = pos - start_pos + RESPB_HEADER_SIZE;
+    /* Accumulate final component: the actual argument data lengths.
+     * Header bytes and length prefix bytes were already accumulated during parsing. */
+    c->net_input_bytes_curr_cmd += c->argv_len_sum;
     c->read_flags |= READ_FLAGS_PARSING_COMPLETED;
+    c->respb_phase = 0;  /* Reset phase for next command */
     c->reqtype = 0;
 
     /* Try parsing pipelined commands (similar to RESP pipelining) */
+fast_path_pipelining:;
     cmdQueue *queue = &c->cmd_queue;
     serverAssert(queue->len == 0);
     int flag = READ_FLAGS_PARSING_COMPLETED;

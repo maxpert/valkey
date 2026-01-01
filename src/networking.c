@@ -332,6 +332,9 @@ client *createClient(connection *conn) {
     c->cur_script = NULL;
     c->multibulklen = 0;
     c->bulklen = -1;
+    c->respb_phase = 0;
+    c->respb_bulklen = 0;
+    c->respb_remaining = 0;
     c->raw_flag = 0;
     c->capa = 0;
     c->slot = -1;
@@ -3384,6 +3387,9 @@ void resetClient(client *c) {
     c->cur_script = NULL;
     c->net_input_bytes_curr_cmd = 0;
     c->slot = -1;
+    c->respb_phase = 0;
+    c->respb_bulklen = 0;
+    c->respb_remaining = 0;
     c->flag.executing_command = 0;
     c->flag.replication_done = 0;
     c->flag.buffered_reply = 0;
@@ -3681,6 +3687,14 @@ static int parseMultibulk(client *c,
     long long ll;
     int is_replicated = c->read_flags & READ_FLAGS_REPLICATED;
     int auth_required = c->read_flags & READ_FLAGS_AUTH_REQUIRED;
+
+    /* Handle protocol switching from RESPB */
+    if (c->respb_phase != 0) {
+        c->respb_phase = 0;
+        c->respb_bulklen = 0;
+        c->respb_remaining = 0;
+        freeClientArgv(c);
+    }
 
     if (c->multibulklen == 0) {
         /* The client (argc) should have been reset */

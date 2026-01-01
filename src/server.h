@@ -194,7 +194,7 @@ typedef enum {
 } instantaneous_metric_type;
 
 /* Protocol and I/O related defines */
-#define PROTO_IOBUF_LEN (1024 * 16)         /* Generic I/O buffer size */
+#define PROTO_IOBUF_LEN (1024 * 32)         /* Generic I/O buffer size */
 #define PROTO_REPLY_CHUNK_BYTES (16 * 1024) /* 16k output buffer */
 #define PROTO_INLINE_MAX_SIZE (1024 * 64)   /* Max size of inline reads */
 #define PROTO_MBULK_BIG_ARG (1024 * 32)
@@ -1322,6 +1322,13 @@ typedef struct client {
     uint8_t resp;                    /* RESP protocol version. Can be 2, 3, or 4 (RESPB). */
     uint16_t respb_mux_id;           /* RESPB multiplexing ID for current command */
     uint16_t respb_opcode;           /* RESPB opcode for current command */
+    /* RESPB resumable parsing state */
+    int respb_state;                 /* RESPB state */
+    size_t respb_bulklen;            /* Current field length (0 = need to read length) */
+    int respb_arg_idx;               /* Current argument index */
+    int respb_arg_count;             /* Total argument count */
+    uint8_t respb_phase;             /* 0 = need header, 1+ = field-specific phases */
+    uint16_t respb_remaining;        /* Elements remaining for multi-element commands */
     uint8_t cur_tid;                 /* ID of IO thread currently performing IO for this client */
     /* In updateClientMemoryUsage() we track the memory usage of
      * each client and add it to the sum of all the clients of a given type,
